@@ -1,0 +1,1465 @@
+#!/usr/bin/env python3
+"""bashd — disconnect-proof local & remote bash for agents.
+
+Design: https://github.com/.../bashd + docs/RESEARCH.md (summary below).
+
+- One file, Python stdlib only. Two faces: MCP stdio server (`bashd mcp`) and CLI.
+- All state and execution live on the TARGET host (~/.bashd/jobs/<id>/ files or a
+  target-side tmux session). The connection is a cache: losing it at any instant
+  loses no work and no output; every call reconnects and resumes by byte cursor.
+- Sync `run` = sugar over the job substrate (idempotent start + resumable tail);
+  timeouts DETACH (never kill). Killing is an explicit `signal`.
+- Transport is system ssh only (ControlMaster, ProxyJump paths, keepalives).
+  Ids are client-generated so `start` is idempotent across dropped requests.
+
+Substrate layout on a target host:
+  ~/.bashd/jobs/<id>/run.sh out err code lock pid   (batch jobs)
+  ~/.bashd/tmux/<name>.log                          (tty session pipe-pane log)
+"""
+
+import argparse
+import base64
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal as _signal
+import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+VERSION = "0.2.0"
+ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+ENVKEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DEFAULT_MAX_BYTES = 16384      # per-stream bytes returned per read
+READ_CHUNK = 65536             # bytes fetched per poll inside wait loops
+KEEP_WINDOW = 65536            # wait(): start reading this far back from EOF
+ACC_CAP = 262144               # wait()/run() accumulation cap before dropping head
+POLL_LOCAL = 0.2
+POLL_REMOTE = 0.5
+DEFAULT_ULIMIT_MB = 512        # per-stream file size cap for batch jobs (0 = off)
+
+HOME_DIR = os.environ.get("BASHD_HOME", os.path.expanduser("~/.bashd"))
+
+EXIT_OK, EXIT_ERR, EXIT_UNREACHABLE, EXIT_NOTFOUND, EXIT_RUNNING = 0, 1, 2, 3, 10
+
+
+class BashdError(Exception):
+    code = EXIT_ERR
+
+
+class Unreachable(BashdError):
+    code = EXIT_UNREACHABLE
+
+
+class NotFound(BashdError):
+    code = EXIT_NOTFOUND
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def shq(s):
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def set_home(p):
+    global HOME_DIR
+    HOME_DIR = p
+
+
+# ---------------------------------------------------------------- config
+
+DEFAULT_CONNECT = {"timeout_s": 8, "keepalive_s": 15, "keepalive_max": 3,
+                   "strict_host_keys": "accept-new", "control_master": True}
+
+
+class Host:
+    def __init__(self, name, cfg):
+        if not ID_RE.match(name):
+            raise BashdError("bad host alias %r (allowed: [A-Za-z0-9_-], no ':')" % name)
+        self.name = name
+        self.local = name == "local" and not cfg.get("ssh")
+        self.ssh = cfg.get("ssh")            # user@host, host, or ssh-config alias
+        # paths: "direct" | ssh-args (str/list) | {"hop": "<ssh-target>",
+        #   "hop_args": "<args for the inner ssh, e.g. -i /path/key>", "target": "<inner dst>"}
+        paths = cfg.get("paths") or ["direct"]
+        self.paths = []
+        for p in paths:
+            if p == "direct":
+                self.paths.append({"type": "args", "args": []})
+            elif isinstance(p, dict):
+                self.paths.append({"type": "hop", "hop": p["hop"],
+                                   "hop_args": shlex.split(p.get("hop_args", "")),
+                                   "target": p.get("target") or cfg.get("ssh")})
+            elif isinstance(p, list):
+                self.paths.append({"type": "args", "args": [str(x) for x in p]})
+            else:
+                self.paths.append({"type": "args", "args": shlex.split(str(p))})
+        c = dict(DEFAULT_CONNECT)
+        c.update(cfg.get("connect") or {})
+        self.connect = c
+        self.defaults = cfg.get("defaults") or {}
+        self.notes = cfg.get("notes") or ""
+
+    def describe(self):
+        def rp(p):
+            if p["type"] == "args":
+                return "direct" if not p["args"] else " ".join(p["args"])
+            return "hop via %s -> %s" % (p["hop"], p["target"])
+        return {"name": self.name, "local": self.local, "ssh": self.ssh,
+                "paths": [rp(p) for p in self.paths],
+                "connect": self.connect, "defaults": self.defaults, "notes": self.notes}
+
+
+def load_config():
+    path = os.path.join(HOME_DIR, "hosts.json")
+    hosts = {"local": Host("local", {})}
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for name, cfg in (data.get("hosts") or {}).items():
+            hosts[name] = Host(name, cfg)
+    return hosts
+
+
+def get_host(name, hosts=None):
+    hosts = hosts or load_config()
+    if name not in hosts:
+        raise NotFound("unknown host %r (known: %s)" % (name, ", ".join(sorted(hosts))))
+    return hosts[name]
+
+
+def load_state():
+    path = os.path.join(HOME_DIR, "state.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    os.makedirs(HOME_DIR, exist_ok=True)
+    path = os.path.join(HOME_DIR, "state.json")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.replace(path + ".tmp", path)
+
+
+def note_sticky_path(host, idx):
+    st = load_state()
+    st.setdefault("path", {})[host.name] = idx
+    save_state(st)
+
+
+def sticky_path_idx(host):
+    return load_state().get("path", {}).get(host.name)
+
+
+# ---------------------------------------------------------------- transport
+
+_UNREACHABLE_PAT = re.compile(
+    r"connection (refused|timed out|reset)|no route to host|network is unreachable"
+    r"|name or service not known|temporary failure in name resolution|host unreachable",
+    re.I)
+
+
+def _ssh_opts(host):
+    c = host.connect
+    argv = ["ssh", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=%s" % c["timeout_s"],
+            "-o", "ServerAliveInterval=%s" % c["keepalive_s"],
+            "-o", "ServerAliveCountMax=%s" % c["keepalive_max"],
+            "-o", "StrictHostKeyChecking=%s" % c["strict_host_keys"]]
+    if c["control_master"]:
+        argv += ["-o", "ControlMaster=auto",
+                 "-o", "ControlPath=" + os.path.join(HOME_DIR, "cm-%C"),
+                 "-o", "ControlPersist=600"]
+    return argv
+
+
+def _ssh_base_argv(host, path_args):
+    return _ssh_opts(host) + path_args + [host.ssh]
+
+
+def _ssh_argv_for_path(host, path):
+    """Full argv up to (not including) the remote command, for a normalized path.
+    exec_script appends the remote command (`sh -s`) uniformly."""
+    if path["type"] == "hop":
+        inner = (["ssh"] + path["hop_args"] +
+                 ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                  path["target"]])
+        return _ssh_opts(host) + [path["hop"]] + inner
+    return _ssh_opts(host) + path["args"] + [host.ssh]
+
+
+def exec_script(host, script, timeout_s):
+    """Run a POSIX sh script on the target. Returns (rc, stdout, stderr).
+    Raises Unreachable if no path connects. For host 'local' runs locally."""
+    if host.local:
+        try:
+            p = subprocess.run(["/bin/sh", "-s"], input=script.encode(),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            raise BashdError("local exec timed out after %ss" % timeout_s)
+        return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+
+    order = []
+    si = sticky_path_idx(host)
+    if si is not None and 0 <= si < len(host.paths):
+        order.append(si)
+    order += [i for i in range(len(host.paths)) if i not in order]
+
+    last_err, last_unreach = None, None
+    for idx in order:
+        argv = _ssh_argv_for_path(host, host.paths[idx]) + ["sh", "-s"]
+        try:
+            p = subprocess.run(argv, input=script.encode(), stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               timeout=max(timeout_s, host.connect["timeout_s"] * 2 + 5))
+        except subprocess.TimeoutExpired:
+            last_err = "path %d timed out" % idx
+            continue
+        out = p.stdout.decode("utf-8", "replace")
+        err = p.stderr.decode("utf-8", "replace")
+        if p.returncode == 0:
+            note_sticky_path(host, idx)
+            return 0, out, err
+        if p.returncode == 255 and _UNREACHABLE_PAT.search(err):
+            last_unreach = "path %d: %s" % (idx, err.strip().splitlines()[-1] if err.strip() else "unreachable")
+            continue
+        # auth error, host key, remote sh failure (rc from remote sh propagates as
+        # 255? no: remote rc comes through as-is for exec; 255 is ssh itself)
+        if p.returncode == 255:
+            last_err = "ssh error on path %d: %s" % (idx, err.strip()[-300:])
+        else:
+            note_sticky_path(host, idx)
+            return p.returncode, out, err
+    if last_unreach:
+        raise Unreachable("%s unreachable (%s)" % (host.name, last_unreach))
+    raise BashdError("%s: %s" % (host.name, last_err or "all paths failed"))
+
+
+# ---------------------------------------------------------------- ids
+
+def new_id(host_name=None):
+    return "%s%s" % (format(int(time.time()), "x"), secrets.token_hex(3))
+
+
+def parse_id(jid):
+    parts = jid.split(":")
+    if len(parts) == 2 and ID_RE.match(parts[0]) and ID_RE.match(parts[1]):
+        return get_host(parts[0]), "job", parts[1]
+    if len(parts) == 3 and parts[1] == "tty" and ID_RE.match(parts[0]) and ID_RE.match(parts[2]):
+        return get_host(parts[0]), "tty", parts[2]
+    raise NotFound("bad id %r (expected host:jobid or host:tty:name)" % jid)
+
+
+# ---------------------------------------------------------------- shell script builders
+
+ENVELOPE_FMT = ('printf \'{"out_size":%s,"err_size":%s,"code":"%s","alive":%s,'
+                '"out":"%s","err":"%s"}\\n\' "$o" "$e" "$c" "$a" "$ob" "$eb"')
+
+JOB_READ_TMPL = r'''
+umask 077
+d="$HOME/.bashd/jobs/__ID__"
+if [ ! -d "$d" ]; then echo "BASHD_ENOENT"; exit 0; fi
+o=0; e=0; c="-"; a=1
+[ -f "$d/out" ] && o=$(wc -c < "$d/out" | tr -d " ")
+[ -f "$d/err" ] && e=$(wc -c < "$d/err" | tr -d " ")
+[ -f "$d/code" ] && c=$(cat "$d/code")
+S=$(cat "$d/session" 2>/dev/null)
+if [ -n "$S" ] && ! tmux -L bashd has-session -t $S 2>/dev/null; then a=0; fi
+ob=$(tail -c +$((__CO__ + 1)) "$d/out" 2>/dev/null | head -c __MAX__ | base64 | tr -d "\n")
+eb=$(tail -c +$((__CE__ + 1)) "$d/err" 2>/dev/null | head -c __MAX__ | base64 | tr -d "\n")
+''' + ENVELOPE_FMT + "\n"
+
+# Creation of (or no-op check for) a persistent session on the target. The
+# init line applies session-lifetime settings (ulimit, BASHD_SESSION var).
+# Stale jobs of a freshly re-created session are marked 143 (terminated).
+SESS_ENSURE = r'''
+if command -v tmux >/dev/null 2>&1; then :; else echo "BASHD_RESULT no-tmux"; exit 0; fi
+if ! tmux -L bashd has-session -t __SESS__ 2>/dev/null; then
+  mkdir -p "$HOME/.bashd/tmux"
+  tmux -L bashd new-session -d -s __SESS__ -x 220 -y 50 || { echo "BASHD_RESULT tmux-fail"; exit 0; }
+  tmux -L bashd set-option -t __SESS__ history-limit 50000 >/dev/null 2>&1
+  tmux -L bashd pipe-pane -o -t __SESS__ "cat >> $HOME/.bashd/tmux/__SESS__.log"
+  tmux -L bashd send-keys -t __SESS__ -l -- __INIT__
+  tmux -L bashd send-keys -t __SESS__ Enter
+  sleep 0.3
+  for j in "$HOME"/.bashd/jobs/*/session; do
+    [ -f "$j" ] || continue
+    if [ "$(cat "$j")" = "__SESS__" ] && [ ! -f "$(dirname "$j")/code" ]; then
+      echo 143 > "$(dirname "$j")/code"
+    fi
+  done
+fi
+'''
+
+# Ctrl-C pending junk at the prompt, but never while one of OUR jobs is
+# running in this session (it would kill it); queued lines are safe anyway.
+SESS_BUSYCLEAR = r'''
+busy=0
+for j in "$HOME"/.bashd/jobs/*/session; do
+  [ -f "$j" ] || continue
+  if [ "$(cat "$j")" = "__SESS__" ] && [ ! -f "$(dirname "$j")/code" ]; then busy=1; fi
+done
+if [ "$busy" = 0 ]; then tmux -L bashd send-keys -t __SESS__ C-c; fi
+'''
+
+JOB_SUBMIT_TAIL = r'''
+d="$HOME/.bashd/jobs/__ID__"
+if [ -f "$d/code" ]; then echo "BASHD_RESULT done-exists"; exit 0; fi
+mkdir -p "$d" || { echo "BASHD_RESULT error"; exit 0; }
+echo "__SESS__" > "$d/session"
+if ( set -C; : > "$d/lock" ) 2>/dev/null; then
+__SENDOPS__
+  echo "BASHD_RESULT started"
+else
+  echo "BASHD_RESULT exists"
+fi
+'''
+
+# signal = Ctrl-C into the job's session. Interactive bash DISCARDS pending
+# input on SIGINT (the code-capture line would be eaten), so after a short
+# grace we write 128+2 ourselves if the shell hasn't.
+JOB_SIGNAL_TMPL = r'''
+d="$HOME/.bashd/jobs/__ID__"
+if [ -f "$d/code" ]; then echo "BASHD_RESULT dead"; exit 0; fi
+S=$(cat "$d/session" 2>/dev/null)
+if [ -z "$S" ] || ! tmux -L bashd has-session -t $S 2>/dev/null; then
+  echo "$((128 + __SIGNUM__))" > "$d/code"
+  echo "BASHD_RESULT dead"; exit 0
+fi
+tmux -L bashd send-keys -t $S C-c
+i=0
+while [ $i -lt 10 ] && ! [ -f "$d/code" ]; do sleep 0.3; i=$((i+1)); done
+[ -f "$d/code" ] || echo 130 > "$d/code"
+echo "BASHD_RESULT ctrl-c"
+'''
+
+TTY_READ_TMPL = r'''
+umask 077
+log="$HOME/.bashd/tmux/__NAME__.log"
+s=0
+[ -f "$log" ] && s=$(wc -c < "$log" | tr -d " ")
+a=0
+tmux -L bashd has-session -t __NAME__ 2>/dev/null && a=1
+b=$(tail -c +$((__CO__ + 1)) "$log" 2>/dev/null | head -c __MAX__ | base64 | tr -d "\n")
+sc=""
+if [ "__SCREEN__" = 1 ]; then
+  sc=$(tmux -L bashd capture-pane -t __NAME__ -p 2>/dev/null | base64 | tr -d "\n")
+fi
+printf '{"size":%s,"alive":%s,"out":"%s","screen":"%s"}\n' "$s" "$a" "$b" "$sc"
+'''
+
+TTY_WRITE_TMPL = r'''
+umask 077
+tmux -L bashd send-keys -t __NAME__ -l -- __DATA__ || { echo "BASHD_RESULT error"; exit 0; }
+__ENTER__tmux -L bashd send-keys -t __NAME__ Enter
+echo "BASHD_RESULT ok"
+'''
+
+TTY_SIGNAL_TMPL = r'''
+umask 077
+if [ "__MODE__" = ctrl-c ]; then
+  tmux -L bashd send-keys -t __NAME__ C-c && echo "BASHD_RESULT ctrl-c" || echo "BASHD_RESULT dead"
+else
+  tmux -L bashd kill-session -t __NAME__ 2>/dev/null && echo "BASHD_RESULT killed" || echo "BASHD_RESULT dead"
+fi
+'''
+
+SESSIONS_TMPL = r'''
+umask 077
+echo "BASHD_JOBS"
+for d in "$HOME"/.bashd/jobs/*/; do
+  [ -d "$d" ] || continue
+  c="-"; [ -f "$d/code" ] && c=$(cat "$d/code")
+  s="-"; [ -f "$d/session" ] && s=$(cat "$d/session")
+  o=0; e=0
+  [ -f "$d/out" ] && o=$(wc -c < "$d/out" | tr -d " ")
+  [ -f "$d/err" ] && e=$(wc -c < "$d/err" | tr -d " ")
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(basename "$d")" "$c" "$o" "$e" "$s"
+done
+echo "BASHD_TTYS"
+tmux -L bashd list-sessions -F '#S' 2>/dev/null || true
+echo "BASHD_TTYLOGS"
+for l in "$HOME"/.bashd/tmux/*.log; do
+  [ -f "$l" ] || continue
+  printf '%s\t%s\n' "$(basename "$l" .log)" "$(wc -c < "$l" | tr -d " ")"
+done
+echo "BASHD_DONE"
+'''
+
+
+def _submit_ops(jid, cmd, cwd, env):
+    """Lines to type into the persistent session shell so cmd runs INSIDE it
+    (cd/export persist) with output captured to the job's files. $HOME expands
+    in the session shell; every usage of $D is pre-quoted here."""
+    J = "$HOME/.bashd/jobs/" + jid
+    lines = ['D="%s"; : >"$D/out"; : >"$D/err"' % J]
+    if env:
+        lines.append("export " + " ".join("%s=%s" % (k, shq(v)) for k, v in sorted(env.items())))
+    if cwd:
+        lines.append("cd %s || { echo 97 >\"$D/code\"; }" % shq(cwd))
+    delim = "BASHD_D_" + secrets.token_hex(4)
+    printable = all(ch.isprintable() or ch == "\t" for ch in cmd)
+    maxline = max((len(x) for x in cmd.split("\n")), default=0)
+    if cmd and len(cmd) <= 2000 and maxline <= 500 and printable:
+        lines.append("cat >\"$D/run\" <<'%s'" % delim)
+        lines.extend(cmd.split("\n"))
+        lines.append(delim)
+    else:  # arbitrary bytes / very long lines: base64 keeps tty lines short
+        lines.append("base64 -d >\"$D/run\" <<'%s'" % delim)
+        b = base64.b64encode(cmd.encode()).decode()
+        lines.extend(b[i:i + 76] for i in range(0, len(b), 76))
+        lines.append(delim)
+    # eval and code-capture are SEPARATE typed lines: if the command is
+    # Ctrl-C'd, bash aborts the rest of the current input line, so the capture
+    # must live on its own line to still record the (130) code afterwards.
+    lines.append('[ -f "$D/code" ] || eval "$(cat "$D/run")" >"$D/out" 2>"$D/err"')
+    lines.append('rc=$?; [ -f "$D/code" ] || echo "$rc" >"$D/code"')
+    return lines
+
+
+def _send_keys_lines(sess, lines):
+    out = []
+    for ln in lines:
+        if ln:
+            out.append('  tmux -L bashd send-keys -t %s -l -- %s' % (sess, shq(ln)))
+        out.append('  tmux -L bashd send-keys -t %s Enter' % sess)
+    return out
+
+
+def _check_sess_name(s):
+    if not ID_RE.match(s or ""):
+        raise BashdError("bad session name %r (allowed: [A-Za-z0-9_-])" % s)
+    return s
+
+
+def job_start(host, jid, cmd, cwd=None, env=None, ulimit_mb=None, session="main", dry_run=False):
+    _check_sess_name(session)
+    if ulimit_mb is None:
+        ulimit_mb = host.defaults.get("ulimit_mb", DEFAULT_ULIMIT_MB)
+    init = "ulimit -f %d 2>/dev/null; export BASHD_SESSION=%s" % (int(ulimit_mb) * 1024, shq(session))
+    script = ((SESS_ENSURE + SESS_BUSYCLEAR)
+              .replace("__SESS__", session).replace("__INIT__", shq(init)))
+    script += (JOB_SUBMIT_TAIL.replace("__SESS__", session).replace("__ID__", jid)
+               .replace("__SENDOPS__",
+                        "\n".join(_send_keys_lines(session, _submit_ops(jid, cmd, cwd, env)))))
+    if dry_run:
+        return {"dry_run": exec_argv_preview(host, script)}
+    out = exec_script(host, script, timeout_s=60)[1]
+    m = re.search(r"BASHD_RESULT (\S+)", out)
+    state = m.group(1) if m else "unknown"
+    if state == "no-tmux":
+        raise BashdError("tmux is not installed on host %r (required in v0.2: all modes "
+                         "run inside persistent tmux sessions)" % host.name)
+    if state in ("error", "tmux-fail"):
+        raise BashdError("job start failed on %s (session %s)" % (host.name, session))
+    return state
+
+
+def _b64d(s):
+    if not s:
+        return b""
+    return base64.b64decode(s)
+
+
+def _code_to_int(c):
+    if c is None or c in ("-", ""):
+        return None
+    try:
+        return int(c)
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------- job substrate ops
+
+
+def exec_argv_preview(host, script):
+    if host.local:
+        return {"argv": ["/bin/sh", "-s"], "stdin": script}
+    return {"argv": _ssh_argv_for_path(host, host.paths[0]), "stdin": script}
+
+
+def job_read(host, jid, cursor_out=0, cursor_err=0, max_bytes=DEFAULT_MAX_BYTES, dry_run=False):
+    script = (JOB_READ_TMPL.replace("__ID__", jid)
+              .replace("__CO__", str(int(cursor_out)))
+              .replace("__CE__", str(int(cursor_err)))
+              .replace("__MAX__", str(int(max_bytes))))
+    if dry_run:
+        return {"dry_run": exec_argv_preview(host, script)}
+    out = exec_script(host, script, timeout_s=60)[1].strip()
+    if "BASHD_ENOENT" in out.splitlines()[-1] if out else False:
+        raise NotFound("no such job %r on %s" % (jid, host.name))
+    try:
+        line = out.splitlines()[-1] if out else ""
+        env = json.loads(line)
+    except (ValueError, IndexError):
+        raise BashdError("job read: bad envelope from %s: %r" % (host.name, out[-200:]))
+    ob, eb = _b64d(env["out"]), _b64d(env["err"])
+    return {"status": "done" if env["code"] not in ("-", "") else "running",
+            "exit_code": _code_to_int(env["code"]),
+            "alive": bool(int(env.get("alive", 1))),
+            "stdout": ob.decode("utf-8", "replace"),
+            "stderr": eb.decode("utf-8", "replace"),
+            "cursor_out": cursor_out + len(ob),
+            "cursor_err": cursor_err + len(eb),
+            "out_size": int(env["out_size"]), "err_size": int(env["err_size"])}
+
+
+def job_signal(host, jid, sig="TERM", dry_run=False):
+    signum = _signal.Signals["SIG" + sig].value if isinstance(sig, str) else int(sig)
+    script = (JOB_SIGNAL_TMPL.replace("__ID__", jid).replace("__SIGNUM__", str(signum)))
+    if dry_run:
+        return {"dry_run": exec_argv_preview(host, script)}
+    out = exec_script(host, script, timeout_s=30)[1]
+    m = re.search(r"BASHD_RESULT (\S+)", out)
+    return {"action": m.group(1) if m else "unknown"}
+
+
+# ---------------------------------------------------------------- tty substrate ops
+
+def session_ensure(host, name, ulimit_mb=None, dry_run=False):
+    """Create the persistent session if missing (init line: ulimit + marker var)."""
+    _check_sess_name(name)
+    if ulimit_mb is None:
+        ulimit_mb = host.defaults.get("ulimit_mb", DEFAULT_ULIMIT_MB)
+    init = "ulimit -f %d 2>/dev/null; export BASHD_SESSION=%s" % (int(ulimit_mb) * 1024, shq(name))
+    script = SESS_ENSURE.replace("__SESS__", name).replace("__INIT__", shq(init))
+    script += 'echo "BASHD_RESULT ok"\n'
+    if dry_run:
+        return {"dry_run": exec_argv_preview(host, script)}
+    out = exec_script(host, script, timeout_s=60)[1]
+    m = re.search(r"BASHD_RESULT (\S+)", out)
+    state = m.group(1) if m else "unknown"
+    if state == "no-tmux":
+        raise BashdError("tmux is not installed on host %r (required in v0.2: all modes "
+                         "run inside persistent tmux sessions)" % host.name)
+    if state == "tmux-fail":
+        raise BashdError("session create failed on %s (%s)" % (host.name, name))
+    return state
+
+
+def tty_read(host, name, cursor=0, max_bytes=DEFAULT_MAX_BYTES, screen=False, dry_run=False):
+    script = (TTY_READ_TMPL.replace("__NAME__", name)
+              .replace("__CO__", str(int(cursor)))
+              .replace("__MAX__", str(int(max_bytes)))
+              .replace("__SCREEN__", "1" if screen else "0"))
+    if dry_run:
+        return {"dry_run": exec_argv_preview(host, script)}
+    out = exec_script(host, script, timeout_s=60)[1].strip()
+    try:
+        env = json.loads(out.splitlines()[-1] if out else "{}")
+    except ValueError:
+        raise BashdError("tty read: bad envelope from %s: %r" % (host.name, out[-200:]))
+    ob = _b64d(env.get("out", ""))
+    chunk = ob.decode("utf-8", "replace")
+    return {"alive": bool(env.get("alive")),
+            "stdout": chunk, "cursor": cursor + len(ob),
+            "size": int(env.get("size", 0)),
+            "screen": _b64d(env.get("screen", "")).decode("utf-8", "replace")}
+
+
+def tty_write(host, name, data, append_newline=True, dry_run=False):
+    script = (TTY_WRITE_TMPL.replace("__NAME__", name)
+              .replace("__DATA__", shq(data))
+              .replace("__ENTER__", "" if append_newline is False else ""))
+    if dry_run:
+        return {"dry_run": exec_argv_preview(host, script)}
+    out = exec_script(host, script, timeout_s=30)[1]
+    return {"written": len(data),
+            "ok": "BASHD_RESULT ok" in out}
+
+
+def tty_signal(host, name, mode, dry_run=False):
+    script = (TTY_SIGNAL_TMPL.replace("__NAME__", name).replace("__MODE__", mode))
+    if dry_run:
+        return {"dry_run": exec_argv_preview(host, script)}
+    out = exec_script(host, script, timeout_s=30)[1]
+    m = re.search(r"BASHD_RESULT (\S+)", out)
+    return {"action": m.group(1) if m else "unknown"}
+
+
+# ---------------------------------------------------------------- high-level ops
+
+def _tail_cap(s, cap):
+    if len(s) <= cap:
+        return s, 0
+    dropped = len(s) - cap
+    return s[dropped:], dropped
+
+
+def do_run(host, cmd, timeout_s=120, max_bytes=DEFAULT_MAX_BYTES, cwd=None, env=None,
+           jid=None, ulimit_mb=None, session="main", dry_run=False):
+    if dry_run:
+        return job_start(host, "previewid", cmd, cwd, env, ulimit_mb, session=session, dry_run=True)
+    jid = jid or new_id()
+    t0 = time.time()
+    state = job_start(host, jid, cmd, cwd, env, ulimit_mb, session=session)
+    res = {"ok": True, "id": "%s:%s" % (host.name, jid), "host": host.name,
+           "start_state": state, "status": "running", "exit_code": None,
+           "stdout": "", "stderr": "", "cursor_out": 0, "cursor_err": 0,
+           "duration_s": None, "timed_out": False, "note": host.notes}
+    if state == "done-exists":
+        r = job_read(host, jid, 0, 0, max_bytes * 4)
+        res.update(status=r["status"], exit_code=r["exit_code"], stdout=r["stdout"],
+                   stderr=r["stderr"], cursor_out=r["cursor_out"], cursor_err=r["cursor_err"])
+        return res
+    poll = POLL_LOCAL if host.local else POLL_REMOTE
+    acc_o = acc_e = ""
+    while True:
+        time.sleep(poll)
+        try:
+            r = job_read(host, jid, res["cursor_out"], res["cursor_err"], READ_CHUNK)
+        except (Unreachable, BashdError) as e:
+            if time.time() - t0 >= timeout_s:
+                res["dropped_link"] = str(e)
+                break
+            time.sleep(1.0)
+            continue
+        res["cursor_out"], res["cursor_err"] = r["cursor_out"], r["cursor_err"]
+        acc_o += r["stdout"]
+        acc_e += r["stderr"]
+        if len(acc_o) > ACC_CAP:
+            acc_o = acc_o[-ACC_CAP:]
+        if len(acc_e) > ACC_CAP:
+            acc_e = acc_e[-ACC_CAP:]
+        if r["status"] == "done":
+            res["status"] = "done"
+            res["exit_code"] = r["exit_code"]
+            res["duration_s"] = round(time.time() - t0, 3)
+            break
+        if not r.get("alive", True):
+            res["status"] = "dead"
+            res["duration_s"] = round(time.time() - t0, 3)
+            break
+        if time.time() - t0 >= timeout_s:
+            res["timed_out"] = True
+            break
+    acc_o, dropped_o = _tail_cap(acc_o, max_bytes * 8)
+    acc_e, dropped_e = _tail_cap(acc_e, max_bytes * 8)
+    res["stdout"], res["stderr"] = acc_o, acc_e
+    if dropped_o:
+        res["stdout_dropped_head_bytes"] = dropped_o
+    if dropped_e:
+        res["stderr_dropped_head_bytes"] = dropped_e
+    return res
+
+
+def do_wait(host, kind, key, timeout_s=120, until="exit", pattern=None, idle_s=2.0,
+            max_bytes=DEFAULT_MAX_BYTES, until_reachable=False, dry_run=False):
+    if dry_run:
+        return {"dry_run": "wait is runtime-only"}
+    rx = re.compile(pattern, re.MULTILINE) if pattern else None
+    if rx is None and until == "regex":
+        raise BashdError("until=regex requires --pattern")
+    t0 = time.time()
+    deadline = t0 + timeout_s
+    if kind == "job":
+        read = lambda co, ce: job_read(host, key, co, ce, READ_CHUNK)
+    else:
+        read = lambda co, ce: tty_read(host, key, co, READ_CHUNK)
+
+    cur_o = cur_e = 0
+    try:
+        first = read(0, 0)
+        if kind == "job":
+            cur_o = max(0, first["out_size"] - KEEP_WINDOW)
+            cur_e = max(0, first.get("err_size", 0) - KEEP_WINDOW)
+        else:
+            cur_o = max(0, first["size"] - KEEP_WINDOW)
+        entry_unreachable = None
+    except (Unreachable, BashdError) as e:
+        if not until_reachable:
+            raise
+        first, entry_unreachable = None, str(e)
+
+    acc = ""
+    last_change = time.time()
+    code = None
+    alive = True
+    match = None
+    poll = POLL_LOCAL if host.local else POLL_REMOTE
+    backoff = 1.0
+    status = "running"
+    while True:
+        if entry_unreachable is not None:
+            try:
+                first = read(0, 0)
+                cur_o = max(0, first["out_size"] - KEEP_WINDOW)
+                cur_e = max(0, first.get("err_size", 0) - KEEP_WINDOW)
+                sizes = (first["out_size"], first.get("err_size", 0))
+                entry_unreachable = None
+            except (Unreachable, BashdError):
+                if time.time() >= deadline:
+                    raise Unreachable("still unreachable after %ss: %s" % (timeout_s, entry_unreachable))
+                time.sleep(min(backoff, max(0.1, deadline - time.time())))
+                backoff = min(backoff * 2, 5)
+                continue
+        time.sleep(poll)
+        try:
+            if kind == "job":
+                r = read(cur_o, cur_e)
+                new = r["stdout"] + r["stderr"]
+                cur_o, cur_e = r["cursor_out"], r["cursor_err"]
+                code = r["exit_code"]
+                alive = r.get("alive", True)
+            else:
+                r = read(cur_o, 0)
+                new = r["stdout"]
+                cur_o = r["cursor"]
+                alive = r["alive"]
+            backoff = 1.0
+        except (Unreachable, BashdError) as e:
+            if time.time() >= deadline:
+                res = {"ok": True, "status": "running", "link_lost": True,
+                       "link_error": str(e), "waited_s": round(time.time() - t0, 2)}
+                return _wait_result(res, acc, max_bytes, match)
+            time.sleep(min(backoff, max(0.1, deadline - time.time())))
+            backoff = min(backoff * 2, 5)
+            continue
+        if new:
+            acc += new
+            if len(acc) > ACC_CAP:
+                acc = acc[-ACC_CAP:]
+            last_change = time.time()
+        if rx is not None:
+            m = rx.search(acc)
+            if m:
+                match = m.group(0)
+                break
+        if until == "exit" and (code is not None or not alive):
+            break
+        if until == "idle" and (time.time() - last_change) >= idle_s:
+            break
+        if time.time() >= deadline:
+            break
+    waited = round(time.time() - t0, 2)
+    if code is not None:
+        status = "done"
+    elif not alive:
+        status = "dead"
+    else:
+        status = "running"
+    res = {"ok": True, "status": status, "exit_code": code, "waited_s": waited}
+    return _wait_result(res, acc, max_bytes, match)
+
+
+def _wait_result(res, acc, max_bytes, match):
+    acc, dropped = _tail_cap(acc, max_bytes)
+    if dropped:
+        res["dropped_head_bytes"] = dropped
+    res["stdout"] = acc
+    if match:
+        res["match"] = match
+    return res
+
+
+def do_start(host, cmd=None, mode="batch", name=None, cwd=None, env=None, jid=None,
+             session=None, dry_run=False):
+    if mode == "tty" and not cmd:
+        sname = _check_sess_name(session or name or ("s" + secrets.token_hex(3)))
+        state = session_ensure(host, sname, dry_run=dry_run)
+        return {"ok": True, "id": "%s:tty:%s" % (host.name, sname), "mode": "tty",
+                "session": sname, "state": state, "host": host.name, "note": host.notes}
+    if not cmd:
+        raise BashdError("start requires cmd (or mode=tty without cmd for a bare session)")
+    sname = _check_sess_name(session or name or "main")
+    jid = jid or new_id()
+    state = job_start(host, jid, cmd, cwd, env, session=sname, dry_run=dry_run)
+    return {"ok": True, "id": "%s:%s" % (host.name, jid), "mode": mode,
+            "session": sname, "state": state, "host": host.name, "note": host.notes}
+
+
+def do_read(host, kind, key, cursor_out=0, cursor_err=0, max_bytes=DEFAULT_MAX_BYTES,
+            screen=False, dry_run=False):
+    if kind == "job":
+        r = job_read(host, key, cursor_out, cursor_err, max_bytes, dry_run=dry_run)
+        if dry_run:
+            return r
+        return {"ok": True, "id": "%s:%s" % (host.name, key), "host": host.name, **r}
+    r = tty_read(host, key, cursor_out, max_bytes, screen, dry_run=dry_run)
+    if dry_run:
+        return r
+    out = {"ok": True, "id": "%s:tty:%s" % (host.name, key), "host": host.name,
+           "alive": r["alive"], "status": "alive" if r["alive"] else "dead",
+           "stdout": r["stdout"], "cursor_out": r["cursor"],
+           "out_size": r["size"], "err_size": 0}
+    if screen:
+        out["screen"] = r["screen"]
+    return out
+
+
+def do_write(host, kind, key, data, append_newline=True, dry_run=False):
+    if kind != "tty":
+        raise BashdError("write is only supported on tty sessions (id host:tty:name)")
+    return {"ok": True, **tty_write(host, key, data, append_newline, dry_run=dry_run)}
+
+
+def do_signal(host, kind, key, sig="TERM", dry_run=False):
+    if kind == "job":
+        return {"ok": True, "id": "%s:%s" % (host.name, key), **job_signal(host, key, sig, dry_run=dry_run)}
+    mode = "ctrl-c" if sig.upper() in ("INT", "CTRL-C", "C-C") else "kill"
+    return {"ok": True, "id": "%s:tty:%s" % (host.name, key), **tty_signal(host, key, mode, dry_run=dry_run)}
+
+
+def _probe_host(name, host):
+    try:
+        rc, out, err = exec_script(host, SESSIONS_TMPL, timeout_s=15)
+        if rc != 0:
+            return {"host": name, "reachable": True, "error": "remote script rc=%s %s" % (rc, err[-200:])}
+        jobs, ttys = [], []
+        section = None
+        tmux_names = []
+        for line in out.splitlines():
+            if line == "BASHD_JOBS":
+                section = "jobs"
+            elif line == "BASHD_TTYS":
+                section = "tty_names"
+            elif line == "BASHD_TTYLOGS":
+                section = "tty_logs"
+            elif line == "BASHD_DONE":
+                break
+            elif section == "jobs":
+                p = line.split("\t")
+                if len(p) == 5:
+                    jobs.append({"id": "%s:%s" % (name, p[0]), "running": p[1] == "-",
+                                 "exit_code": _code_to_int(p[1]), "out_bytes": int(p[2]),
+                                 "err_bytes": int(p[3]), "session": p[4]})
+            elif section == "tty_names":
+                if line.strip():
+                    tmux_names.append(line.strip())
+            elif section == "tty_logs":
+                p = line.split("\t")
+                if len(p) == 2:
+                    ttys.append({"name": p[0], "id": "%s:tty:%s" % (name, p[0]),
+                                 "alive": p[0] in tmux_names, "log_bytes": int(p[1])})
+        return {"host": name, "reachable": True, "path": "local" if host.local else "ssh",
+                "note": host.notes, "jobs": jobs, "ttys": ttys}
+    except Unreachable as e:
+        return {"host": name, "reachable": False, "error": str(e)}
+    except BashdError as e:
+        return {"host": name, "reachable": False, "error": str(e)}
+
+
+def do_sessions(host_name=None, hosts=None):
+    hosts = hosts or load_config()
+    if host_name:
+        targets = {host_name: get_host(host_name, hosts)}
+    else:
+        targets = hosts
+    with ThreadPoolExecutor(max_workers=min(8, len(targets) or 1)) as ex:
+        results = list(ex.map(lambda kv: _probe_host(kv[0], kv[1]), sorted(targets.items())))
+    return {"ok": True, "hosts": results}
+
+
+def do_prune(host, host_name, dry_run=False):
+    """Remove finished job dirs (code file present) and tty logs whose tmux
+    session is dead. Running jobs and live sessions are never touched."""
+    script = r'''
+umask 077
+n=0
+for d in "$HOME"/.bashd/jobs/*/; do
+  [ -d "$d" ] || continue
+  if [ -f "$d/code" ]; then rm -rf "$d" && n=$((n+1)); fi
+done
+t=0
+tmux -L bashd list-sessions -F '#S' 2>/dev/null | sort > /tmp/.bashd_alive.$$
+for l in "$HOME"/.bashd/tmux/*.log; do
+  [ -f "$l" ] || continue
+  b=$(basename "$l" .log)
+  grep -qx "$b" /tmp/.bashd_alive.$$ || { rm -f "$l" && t=$((t+1)); }
+done
+rm -f /tmp/.bashd_alive.$$
+echo "BASHD_PRUNED jobs=$n logs=$t"
+'''
+    if dry_run:
+        return {"dry_run": exec_argv_preview(host, script)}
+    out = exec_script(host, script, timeout_s=60)[1]
+    m = re.search(r"BASHD_PRUNED jobs=(\d+) logs=(\d+)", out)
+    if not m:
+        raise BashdError("prune: unexpected output from %s" % host_name)
+    return {"ok": True, "host": host_name, "jobs_removed": int(m.group(1)),
+            "tty_logs_removed": int(m.group(2))}
+
+
+def do_hosts():
+    return {"ok": True, "hosts": [h.describe() for _, h in sorted(load_config().items())]}
+
+
+# ---------------------------------------------------------------- MCP server
+
+MCP_PROTOCOL_VERSION = "2024-11-05"
+
+
+def _schema(props, required=None):
+    return {"type": "object", "properties": props,
+            "required": required or []}
+
+
+def _s(t, desc, **kw):
+    d = {"type": t, "description": desc}
+    d.update(kw)
+    return d
+
+
+def mcp_tools():
+    return [
+        {"name": "bash_run", "description":
+            "Run a shell command synchronously on a host. v0.2: commands execute INSIDE a "
+            "persistent tmux session on the target — cd/exports persist across calls (the "
+            "point). Blocks until exit or timeout; on timeout the command KEEPS RUNNING "
+            "remotely and the response includes its id — detach, never kill. Never run "
+            "`exit` (it kills the session; it auto-recreates).",
+         "inputSchema": _schema({
+             "host": _s("string", "Host alias from hosts.json (default 'local')"),
+             "cmd": _s("string", "Shell command to run"),
+             "session": _s("string", "Persistent session name (default 'main'; sessions isolate env)"),
+             "timeout_s": _s("number", "Detach-after seconds (default 120; command keeps running)"),
+             "max_bytes": _s("number", "Max bytes returned per stream (default 16384)"),
+             "cwd": _s("string", "cd here first — and it PERSISTS in the session"),
+             "env": _s("object", "export these first — they PERSIST in the session"),
+             "id": _s("string", "Client-chosen job id (makes retries idempotent)"),
+         }, ["cmd"])},
+        {"name": "bash_start", "description":
+            "Start a command without waiting: submits it into a persistent tmux session "
+            "(default 'main'), returns the job id for bash_read/bash_wait. mode=tty with "
+            "cmd=None just creates/ensures the session for interactive write().",
+         "inputSchema": _schema({
+             "host": _s("string", "Host alias (default 'local')"),
+             "cmd": _s("string", "Command (omit for mode=tty to create a bare session)"),
+             "mode": _s("string", "'batch' (default) or 'tty' (bare session when no cmd)"),
+             "session": _s("string", "Session name (default 'main' for batch)"),
+             "name": _s("string", "Alias for session (tty style)"),
+             "cwd": _s("string", "cd here first — persists"),
+             "env": _s("object", "export these first — persist"),
+             "id": _s("string", "Client-chosen job id (idempotent retries)"),
+         })},
+        {"name": "bash_read", "description":
+            "Read job/session output since byte cursors (resumable across disconnects). "
+            "Returns chunk, next cursors, status, exit_code. For tty also screen=true for "
+            "the live pane.",
+         "inputSchema": _schema({
+             "id": _s("string", "Job or session id (host:jobid or host:tty:name)"),
+             "cursor_out": _s("number", "Byte offset into stdout/log (default 0)"),
+             "cursor_err": _s("number", "Byte offset into stderr (batch jobs; default 0)"),
+             "max_bytes": _s("number", "Max bytes per stream (default 16384)"),
+             "screen": _s("boolean", "tty only: include current pane screen"),
+         }, ["id"])},
+        {"name": "bash_wait", "description":
+            "Block until an event or timeout: until=exit (default) | regex (needs pattern) "
+            "| idle (no output for idle_s). Reconnect-tolerant mid-wait. Long waits: prefer "
+            "the CLI (`bashd wait ID --timeout 3600`) via a background Bash task.",
+         "inputSchema": _schema({
+             "id": _s("string", "Job or session id"),
+             "timeout_s": _s("number", "Overall timeout (default 120)"),
+             "until": _s("string", "exit|regex|idle", enum=["exit", "regex", "idle"]),
+             "pattern": _s("string", "Regex for until=regex"),
+             "idle_s": _s("number", "Quiet period for until=idle (default 2)"),
+             "max_bytes": _s("number", "Max bytes of new output returned (default 16384)"),
+             "until_reachable": _s("boolean", "If host down at entry, keep retrying instead of failing fast"),
+         }, ["id"])},
+        {"name": "bash_write", "description": "Send stdin text to a tty session (prompts, REPLs).",
+         "inputSchema": _schema({
+             "id": _s("string", "Session id (host:tty:name)"),
+             "data": _s("string", "Text to type"),
+             "append_newline": _s("boolean", "Press Enter after (default true)"),
+         }, ["id", "data"])},
+        {"name": "bash_signal", "description":
+            "Stop work: job id = Ctrl-C into the job's session (the trailing code capture "
+            "still runs, so exit lands as 128+2); tty session with sig INT = Ctrl-C, "
+            "anything else kills the whole session.",
+         "inputSchema": _schema({
+             "id": _s("string", "Job or session id"),
+             "sig": _s("string", "INT (default) | KILL | TERM | HUP — jobs always get Ctrl-C"),
+         }, ["id"])},
+        {"name": "bash_sessions", "description":
+            "Fleet overview: probes hosts in parallel (fail-fast per host), lists jobs "
+            "(running/exit code/sizes) and tty sessions (alive/log size) per host.",
+         "inputSchema": _schema({"host": _s("string", "Restrict to one host alias")})},
+        {"name": "bash_prune", "description":
+            "Remove finished batch-job records and tty logs of dead sessions from a host's "
+            "~/.bashd (running jobs and live sessions are never touched).",
+         "inputSchema": _schema({"host": _s("string", "Host alias")}, ["host"])},
+        {"name": "bash_hosts", "description": "Show the host registry (aliases, paths, notes, defaults).",
+         "inputSchema": _schema({})},
+    ]
+
+
+def mcp_dispatch(name, args):
+    hosts = load_config()
+    if name == "bash_hosts":
+        return do_hosts()
+    if name == "bash_sessions":
+        return do_sessions(args.get("host"), hosts)
+    if name == "bash_prune":
+        h = get_host(args.get("host", "local"), hosts)
+        return do_prune(h, h.name)
+    if name == "bash_run":
+        h = get_host(args.get("host", "local"), hosts)
+        return do_run(h, args["cmd"], float(args.get("timeout_s", 120)),
+                      int(args.get("max_bytes", DEFAULT_MAX_BYTES)),
+                      args.get("cwd"), args.get("env"), args.get("id"),
+                      session=args.get("session", "main"))
+    if name == "bash_start":
+        h = get_host(args.get("host", "local"), hosts)
+        return do_start(h, args.get("cmd"), args.get("mode", "batch"), args.get("name"),
+                        args.get("cwd"), args.get("env"), args.get("id"),
+                        session=args.get("session"))
+    if name == "bash_read":
+        host, kind, key = parse_id(args["id"])
+        return do_read(host, kind, key, int(args.get("cursor_out", 0)),
+                       int(args.get("cursor_err", 0)),
+                       int(args.get("max_bytes", DEFAULT_MAX_BYTES)),
+                       bool(args.get("screen")))
+    if name == "bash_wait":
+        host, kind, key = parse_id(args["id"])
+        return do_wait(host, kind, key, float(args.get("timeout_s", 120)),
+                       args.get("until", "exit"), args.get("pattern"),
+                       float(args.get("idle_s", 2.0)),
+                       int(args.get("max_bytes", DEFAULT_MAX_BYTES)),
+                       bool(args.get("until_reachable")))
+    if name == "bash_write":
+        host, kind, key = parse_id(args["id"])
+        return do_write(host, kind, key, args["data"], args.get("append_newline", True))
+    if name == "bash_signal":
+        host, kind, key = parse_id(args["id"])
+        return do_signal(host, kind, key, args.get("sig", "TERM"))
+    raise NotFound("unknown tool %r" % name)
+
+
+def mcp_server():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(msg, dict):
+            continue
+        mid, method = msg.get("id"), msg.get("method")
+        if not method or mid is None:
+            continue  # notification or garbage
+        try:
+            if method == "initialize":
+                pv = msg.get("params", {}).get("protocolVersion") or MCP_PROTOCOL_VERSION
+                result = {"protocolVersion": pv,
+                          "capabilities": {"tools": {}},
+                          "serverInfo": {"name": "bashd", "version": VERSION}}
+            elif method == "tools/list":
+                result = {"tools": mcp_tools()}
+            elif method == "tools/call":
+                p = msg.get("params", {})
+                try:
+                    r = mcp_dispatch(p.get("name", ""), p.get("arguments") or {})
+                    result = {"content": [{"type": "text", "text": json.dumps(r, ensure_ascii=False)}],
+                              "isError": False}
+                except BashdError as e:
+                    result = {"content": [{"type": "text", "text": json.dumps(
+                        {"ok": False, "error": str(e), "code": e.code})}], "isError": True}
+                except Exception as e:  # noqa: BLE001 — report, never crash the server
+                    result = {"content": [{"type": "text", "text": json.dumps(
+                        {"ok": False, "error": "%s: %s" % (type(e).__name__, e)})}], "isError": True}
+            elif method == "ping":
+                result = {}
+            else:
+                _respond(mid, None, {"code": -32601, "message": "method not found: %s" % method})
+                continue
+            _respond(mid, result, None)
+        except Exception as e:  # noqa: BLE001
+            _respond(mid, None, {"code": -32603, "message": str(e)})
+
+
+def _respond(mid, result, error):
+    msg = {"jsonrpc": "2.0", "id": mid}
+    if error:
+        msg["error"] = error
+    else:
+        msg["result"] = result
+    sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------- CLI
+
+def _print(res):
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+
+
+def cli_hosts(_a):
+    _print(do_hosts())
+
+
+def cli_sessions(a):
+    _print(do_sessions(a.host))
+
+
+def cli_run(a):
+    host = get_host(a.host)
+    res = do_run(host, " ".join(a.cmd), a.timeout_s, a.max_bytes, a.cwd, _kv(a.env), a.id,
+                 session=a.session)
+    _print(res)
+    if res.get("status") != "done":
+        sys.exit(EXIT_RUNNING)
+
+
+def cli_start(a):
+    host = get_host(a.host)
+    _print(do_start(host, " ".join(a.cmd) if a.cmd else None, a.mode, a.name,
+                    a.cwd, _kv(a.env), a.id, session=a.session, dry_run=a.dry_run))
+
+
+def cli_read(a):
+    host, kind, key = parse_id(a.id)
+    _print(do_read(host, kind, key, a.cursor_out, a.cursor_err, a.max_bytes, a.screen, a.dry_run))
+
+
+def cli_wait(a):
+    host, kind, key = parse_id(a.id)
+    _print(do_wait(host, kind, key, a.timeout_s, a.until, a.pattern, a.idle_s,
+                   a.max_bytes, a.until_reachable))
+
+
+def cli_write(a):
+    host, kind, key = parse_id(a.id)
+    _print(do_write(host, kind, key, a.data, not a.no_newline))
+
+
+def cli_signal(a):
+    host, kind, key = parse_id(a.id)
+    _print(do_signal(host, kind, key, a.sig))
+
+
+def cli_prune(a):
+    h = get_host(a.host)
+    _print(do_prune(h, h.name, a.dry_run))
+
+
+def _kv(pairs):
+    out = {}
+    for p in pairs or []:
+        if "=" not in p:
+            raise BashdError("bad --env %r (want KEY=VALUE)" % p)
+        k, v = p.split("=", 1)
+        out[k] = v
+    return out
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="bashd", description=__doc__.splitlines()[0])
+    ap.add_argument("--version", action="version", version="bashd %s" % VERSION)
+    sub = ap.add_subparsers(dest="cmd_", required=True)
+
+    p = sub.add_parser("run", help="sync run inside the persistent session (timeout detaches)")
+    p.add_argument("host"), p.add_argument("cmd", nargs="+")
+    p.add_argument("--session", default="main", help="persistent session (env/cwd persist per session)")
+    p.add_argument("--timeout", dest="timeout_s", type=float, default=120)
+    p.add_argument("--max-bytes", dest="max_bytes", type=int, default=DEFAULT_MAX_BYTES)
+    p.add_argument("--cwd"), p.add_argument("--env", action="append")
+    p.add_argument("--id", help="client-chosen job id (idempotent retries)")
+    p.set_defaults(fn=cli_run)
+
+    p = sub.add_parser("start", help="submit a command (or create a tty session), return id")
+    p.add_argument("host"), p.add_argument("cmd", nargs="*")
+    p.add_argument("--mode", choices=["batch", "tty"], default="batch")
+    p.add_argument("--session", help="session name (default 'main'; tty default: random)")
+    p.add_argument("--name", help="alias for --session (tty style)")
+    p.add_argument("--cwd"), p.add_argument("--env", action="append")
+    p.add_argument("--id"), p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cli_start)
+
+    p = sub.add_parser("read", help="read output since cursors")
+    p.add_argument("id")
+    p.add_argument("--cursor-out", dest="cursor_out", type=int, default=0)
+    p.add_argument("--cursor-err", dest="cursor_err", type=int, default=0)
+    p.add_argument("--max-bytes", dest="max_bytes", type=int, default=DEFAULT_MAX_BYTES)
+    p.add_argument("--screen", action="store_true", help="tty: include live pane")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cli_read)
+
+    p = sub.add_parser("wait", help="block until exit|regex|idle or timeout")
+    p.add_argument("id")
+    p.add_argument("--timeout", dest="timeout_s", type=float, default=120)
+    p.add_argument("--until", choices=["exit", "regex", "idle"], default="exit")
+    p.add_argument("--pattern"), p.add_argument("--idle-s", dest="idle_s", type=float, default=2.0)
+    p.add_argument("--max-bytes", dest="max_bytes", type=int, default=DEFAULT_MAX_BYTES)
+    p.add_argument("--until-reachable", dest="until_reachable", action="store_true")
+    p.set_defaults(fn=cli_wait)
+
+    p = sub.add_parser("write", help="send stdin to a tty session")
+    p.add_argument("id"), p.add_argument("data")
+    p.add_argument("--no-newline", dest="no_newline", action="store_true")
+    p.set_defaults(fn=cli_write)
+
+    p = sub.add_parser("signal", help="signal job (TERM/KILL/INT/HUP) or tty (INT=C-c, else kill)")
+    p.add_argument("id"), p.add_argument("--sig", default="TERM")
+    p.set_defaults(fn=cli_signal)
+
+    p = sub.add_parser("sessions", help="fleet overview (jobs + ttys per host)")
+    p.add_argument("host", nargs="?")
+    p.set_defaults(fn=cli_sessions)
+
+    p = sub.add_parser("prune", help="remove finished job records + dead tty logs on a host")
+    p.add_argument("host")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cli_prune)
+
+    p = sub.add_parser("hosts", help="show host registry")
+    p.set_defaults(fn=cli_hosts)
+
+    p = sub.add_parser("mcp", help="run as MCP stdio server")
+    p.set_defaults(fn=lambda a: mcp_server())
+
+    p = sub.add_parser("selftest", help="run built-in end-to-end tests (local substrate)")
+    p.set_defaults(fn=lambda a: sys.exit(selftest()))
+
+    return ap
+
+
+# ---------------------------------------------------------------- selftest
+
+def selftest():
+    tmp = tempfile.mkdtemp(prefix="bashd-selftest-")
+    os.environ["BASHD_HOME"] = tmp
+    set_home(tmp)
+    os.makedirs(os.path.join(tmp, ".bashd-internal"), exist_ok=True)
+    with open(os.path.join(tmp, "hosts.json"), "w") as f:
+        json.dump({"hosts": {"local": {}}}, f)
+    os.makedirs(HOME_DIR, exist_ok=True)
+
+    results = []
+
+    def check(name, fn):
+        try:
+            fn()
+            results.append((name, True, ""))
+            print("PASS %s" % name)
+        except Exception as e:  # noqa: BLE001
+            results.append((name, False, str(e)))
+            print("FAIL %s: %s" % (name, e))
+
+    H = get_host("local", load_config())
+
+    def stid():
+        return "st" + secrets.token_hex(3)
+
+    def t_run():
+        # NB: no bare `exit` — it would kill the persistent session (by design)
+        r = do_run(H, "echo out1; echo err1 >&2; sh -c 'exit 3'", timeout_s=20, jid=stid())
+        assert r["status"] == "done" and r["exit_code"] == 3, r
+        assert r["stdout"].strip() == "out1" and r["stderr"].strip() == "err1", r
+    check("run sync + streams + exit code", t_run)
+
+    def t_run_env():
+        r = do_run(H, 'printf "%s-%s" "$A" "$PWD"', cwd="/tmp", env={"A": "vv"},
+                   timeout_s=20, jid=stid())
+        assert r["exit_code"] == 0 and r["stdout"] == "vv-/tmp", r
+    check("run cwd + env", t_run_env)
+
+    def t_persist():
+        v = "PV" + secrets.token_hex(2).upper()
+        do_run(H, "export %s=hello" % v, timeout_s=20, jid=stid())
+        r = do_run(H, 'printf "%%s" "$%s"' % v, timeout_s=20, jid=stid())
+        assert r["stdout"] == "hello", r
+        do_run(H, "pwd", cwd="/tmp", timeout_s=20, jid=stid())
+        r2 = do_run(H, "pwd", timeout_s=20, jid=stid())
+        assert r2["stdout"].strip() == "/tmp", r2
+    check("persistent env + cwd across runs", t_persist)
+
+    def t_isolation():
+        v = "IV" + secrets.token_hex(2).upper()
+        do_run(H, "export %s=secret" % v, timeout_s=20, session="iso1", jid=stid())
+        r = do_run(H, 'printf "%%s" "${%s-}"' % v, timeout_s=20, jid=stid())
+        assert r["stdout"] == "", r
+        r2 = do_run(H, 'printf "%%s" "$%s"' % v, timeout_s=20, session="iso1", jid=stid())
+        assert r2["stdout"] == "secret", r2
+    check("sessions isolate environments", t_isolation)
+
+    def t_detach():
+        r = do_run(H, "sleep 5; echo late", timeout_s=1, jid=stid())
+        assert r["status"] == "running" and r["timed_out"], r
+        w = do_wait(H, *parse_id(r["id"])[1:], timeout_s=20)
+        assert w["status"] == "done" and "late" in w["stdout"], w
+    check("timeout detaches + wait resumes", t_detach)
+
+    def t_idem():
+        jid = stid()
+        s1 = job_start(H, jid, "echo once")
+        s2 = job_start(H, jid, "echo once")
+        assert s1 == "started" and s2 in ("exists", "done-exists"), (s1, s2)
+        w = do_wait(H, "job", jid, timeout_s=10)
+        assert w["stdout"].strip() == "once", w
+    check("idempotent start", t_idem)
+
+    def t_cursor():
+        r = do_run(H, "seq 1 100", timeout_s=20, jid=stid())
+        h, kind, key = parse_id(r["id"])
+        c1 = job_read(h, key, 0, 0, 10)
+        assert len(c1["stdout"]) == 10 and c1["cursor_out"] == 10, c1
+        c2 = job_read(h, key, c1["cursor_out"], 0, 4096)
+        assert c2["cursor_out"] == c2["out_size"], c2
+        assert c2["status"] == "done" and c2["exit_code"] == 0, c2
+        full = c1["stdout"] + c2["stdout"]
+        assert full == "".join("%d\n" % i for i in range(1, 101)), "reassembled stream wrong"
+    check("cursor reads", t_cursor)
+
+    def t_regex():
+        jid = stid()
+        job_start(H, jid, "sleep 1; echo READY_NOW")
+        w = do_wait(H, "job", jid, timeout_s=15, until="regex", pattern="READY_NOW")
+        assert w["match"] == "READY_NOW", w
+    check("wait until=regex", t_regex)
+
+    def t_idle():
+        jid = stid()
+        job_start(H, jid, "echo tick; sleep 30")
+        w = do_wait(H, "job", jid, timeout_s=10, until="idle", idle_s=1.0)
+        assert w["status"] == "running" and "tick" in w["stdout"], w
+        job_signal(H, jid, "KILL")
+        time.sleep(0.5)
+        r = job_read(H, jid, 0, 0, 100)
+        assert r["exit_code"] == 130, r
+    check("wait until=idle + signal ctrl-c (130)", t_idle)
+
+    def t_exit_hazard():
+        r = do_run(H, "exit 0", timeout_s=15, jid=stid())
+        assert r["status"] == "dead" and r["exit_code"] is None, r
+        r2 = do_run(H, "echo recovered", timeout_s=20, jid=stid())
+        assert r2["status"] == "done" and r2["stdout"].strip() == "recovered", r2
+    check("`exit` kills session; session auto-recreates", t_exit_hazard)
+
+    def t_notfound():
+        try:
+            job_read(H, stid())
+            raise AssertionError("expected NotFound")
+        except NotFound:
+            pass
+    check("missing job handled", t_notfound)
+
+    def t_sessions():
+        r = do_sessions("local")
+        hst = r["hosts"][0]
+        assert hst["reachable"], hst
+        assert any(j["id"].startswith("local:") for j in hst["jobs"]), hst
+    check("sessions listing", t_sessions)
+
+    def t_mcp():
+        import itertools
+        p = subprocess.Popen([os.path.abspath(__file__), "mcp"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True)
+        msgs = [
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {"protocolVersion": "2024-11-05"}}),
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": {"name": "bash_run",
+                                   "arguments": {"cmd": "echo mcp_ok", "timeout_s": 20,
+                                                 "id": "st" + secrets.token_hex(3)}}}),
+        ]
+        try:
+            out, _ = p.communicate("\n".join(msgs) + "\n", timeout=60)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        replies = {}
+        for line in out.splitlines():
+            try:
+                m = json.loads(line)
+                replies[m.get("id")] = m
+            except ValueError:
+                pass
+        assert 1 in replies and 2 in replies and 3 in replies, replies
+        tools = replies[2]["result"]["tools"]
+        assert len(tools) == 9, tools
+        payload = json.loads(replies[3]["result"]["content"][0]["text"])
+        assert payload["status"] == "done" and payload["stdout"].strip() == "mcp_ok", payload
+    check("MCP stdio roundtrip", t_mcp)
+
+    def t_tty():
+        if not shutil.which("tmux"):
+            print("SKIP tty tests (no tmux)")
+            return
+        name = "st" + secrets.token_hex(3)
+        s = do_start(H, mode="tty", name=name)
+        assert s["id"].endswith(":tty:" + name) and s["state"] == "ok", s
+        wr = do_write(H, "tty", name, "echo inter_$((5*8))")
+        assert wr["ok"], wr
+        w = do_wait(H, "tty", name, timeout_s=20, until="regex", pattern=r"inter_40")
+        assert w["match"] == "inter_40", w
+        rd = do_read(H, "tty", name, screen=True)
+        assert "inter_40" in rd.get("screen", ""), rd
+        sg = do_signal(H, "tty", name, "KILL")
+        assert sg["action"] == "killed", sg
+    check("interactive tty session (write/screen/kill)", t_tty)
+
+    def t_hop():
+        # nested ssh hop, end-to-end through this machine's own sshd (skip if no self-auth)
+        pre = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o",
+                              "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5",
+                              "127.0.0.1", "echo ok"], capture_output=True, timeout=20)
+        if pre.returncode != 0:
+            print("SKIP hop test (no ssh self-auth)")
+            return
+        h = Host("hoptest", {"ssh": "127.0.0.1", "paths": [{"hop": "127.0.0.1"}]})
+        r = do_run(h, "echo hop_ok", timeout_s=30)
+        assert r["status"] == "done" and r["stdout"].strip() == "hop_ok", r
+    check("nested hop path", t_hop)
+
+    def t_prune():
+        h = get_host("local", load_config())
+        jid = stid()
+        job_start(h, jid, "true")
+        w = do_wait(h, "job", jid, timeout_s=10)
+        assert w["status"] == "done", w
+        r = do_prune(h, "local")
+        assert r["jobs_removed"] >= 1, r
+    check("prune finished jobs", t_prune)
+
+    def t_cleanup():
+        # selftest jobs live on the real local substrate (~/.bashd) — remove our st* artifacts
+        exec_script(H, r'''
+tmux -L bashd list-sessions -F '#S' 2>/dev/null | grep '^st' | while read -r s; do
+  tmux -L bashd kill-session -t "$s" 2>/dev/null
+done
+rm -rf "$HOME"/.bashd/jobs/st* "$HOME"/.bashd/tmux/st*.log 2>/dev/null
+echo CLEANED''', 15)
+    check("selftest cleanup", t_cleanup)
+
+    os.environ["BASHD_HOME"] = os.path.expanduser("~/.bashd")
+    set_home(os.environ["BASHD_HOME"])
+    shutil.rmtree(tmp, ignore_errors=True)
+    npass = sum(1 for _, ok, _ in results if ok)
+    nskip = 1 if any("SKIP" in (msg or "") for _, _, msg in results) else 0
+    print("\n%d/%d passed%s" % (npass, len(results) - nskip,
+                                " (+1 skipped: no tmux)" if nskip else ""))
+    return 0 if npass == len(results) - nskip else 1
+
+
+def main():
+    os.makedirs(HOME_DIR, exist_ok=True)
+    args = build_parser().parse_args()
+    try:
+        args.fn(args)
+    except BashdError as e:
+        eprint("error: %s" % e)
+        sys.exit(e.code)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
