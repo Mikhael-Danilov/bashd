@@ -3,7 +3,10 @@
     "local": {},
     "web": {
       "ssh": "deploy@203.0.113.10",
-      "paths": ["direct", "-J jump@203.0.113.7"],
+      "paths": [
+        "direct",
+        {"args": ["-J", "jump@203.0.113.7"], "cost": 5}
+      ],
       "connect": {"timeout_s": 5, "keepalive_s": 15, "keepalive_max": 3},
       "defaults": {"timeout_s": 300, "ulimit_mb": 512},
       "notes": "prod web node; never restart nginx outside the maintenance window"
@@ -12,6 +15,14 @@
       "ssh": "ci@build.internal",
       "paths": ["direct"],
       "notes": "throwaway builder; ok to kill anything"
+    },
+    "edge": {
+      "ssh": "ops@203.0.113.99",
+      "paths": [
+        {"args": ["-o", "HostName=203.0.113.99"], "cost": 1},
+        {"hop": "root@203.0.113.7", "hop_args": "-i /root/.ssh/id_ed25519_relay", "cost": 5}
+      ],
+      "notes": "path 0 is cheap and usually fine; the nested hop is the storm relay — bashd latches it when direct dies and auto-promotes direct back once it recovers"
     }
   }
 }

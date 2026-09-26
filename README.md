@@ -31,8 +31,14 @@ no work and no output; every call reconnects and resumes by byte cursor.
   exit `143` on the next read — it never lingers as an eternal "running" record.
 - **Transport is system ssh only.** ControlMaster reuse on *both* legs of a nested hop (the
   inner leg keeps its own mux socket on the relay, so warm calls skip the inner handshake),
-  `ServerAlive` keepalives, ordered multi-path fallback (direct / args overrides / nested
-  hops), host aliases resolved through your normal ssh config. No paramiko.
+  `ServerAlive` keepalives, cost-ordered multi-path fallback (direct / args overrides /
+  nested hops), host aliases resolved through your normal ssh config. No paramiko.
+- **Routes self-heal.** A mid-command transport death fails the call over to the next path
+  automatically — sync `run` retries its idempotent submit across short outages (up to 15 s)
+  and its poll loop simply switches routes, reporting `link_recovered`/`link_drops`; errors
+  carry a per-path attempt trail (`attempts: path0:unreachable; path1:timeout`). Once a
+  costlier fallback latches, a detached background probe keeps testing the cheaper path
+  (backoff 30 s → 15 min) and re-latches it on recovery — no calls are blocked by probing.
 - **Host registry with notes.** `~/.bashd/hosts.json` maps aliases to connection details and
   per-host notes that ride along in every response (fleet gotchas become first-class metadata).
 
@@ -64,14 +70,21 @@ mkdir -p ~/.bashd && cp hosts.json.example ~/.bashd/hosts.json  # then edit
 }
 ```
 
-- `paths` — tried in order per attempt; the last-good path is sticky until it fails. Forms:
+- `paths` — tried cheapest-first per attempt; the last-good path is **sticky** until it
+  fails, and a detached background probe re-latches the cheapest path when it recovers
+  (exponential backoff, 30 s → 15 min; `bashd paths` shows the state, `--repath` forces a
+  probe now). Forms — a dict form may carry **`"cost"`** (lower = preferred; default cost =
+  position, so config order IS the preference order):
   - `"direct"` — plain connection to `ssh`;
   - ssh args (string or list) — e.g. `"-o HostName=203.0.113.99"` (override destination),
     `"-J jump@host"` (TCP relay through a jump);
-  - `{"hop": "root@relay.example", "hop_args": "-i /root/.ssh/id_ed25519_relay"}` — **nested ssh
-    hop**: first ssh to `hop`, then from that shell ssh onward to `ssh` (or `"target"`)
-    using the hop's own keys. The reliable shape for flaky relays where `-J` TCP-forwarding
-    stalls at banner exchange, and for keys that live on the relay rather than locally.
+  - `{"args": ["-J", "jump@host"], "cost": 1}` — args form with an explicit cost;
+  - `{"hop": "root@relay.example", "hop_args": "-i /root/.ssh/id_ed25519_relay", "cost": 5}` —
+    **nested ssh hop**: first ssh to `hop`, then from that shell ssh onward to `ssh` (or
+    `"target"`) using the hop's own keys. The reliable shape for flaky relays where `-J`
+    TCP-forwarding stalls at banner exchange, and for keys that live on the relay rather
+    than locally. Give it a higher cost than the direct path so the auto-probe promotes
+    the direct path back once it recovers.
 - `ssh` may be a plain `user@host` **or an alias from `~/.ssh/config`** — keys, ProxyJump
   and everything else come from OpenSSH itself.
 - `notes` are returned in `run`/`start`/`sessions` responses.
@@ -95,8 +108,10 @@ bashd read web:tty:ops --screen                # live pane
 bashd sessions                                 # fleet overview, parallel, fail-fast
 bashd prune web                                # remove finished job records + dead tty logs
 bashd prune web --stale 3600                   # also reap codeless jobs quiet 1h (wedged, session alive)
+bashd paths web                                # route table: costs, sticky path, probe backoff
+bashd paths web --repath                       # probe cheaper paths now, re-latch the first that works
 bashd hosts                                    # show registry
-bashd selftest                                 # 19 end-to-end checks
+bashd selftest                                 # 20 end-to-end checks
 ```
 
 **Persistent-environment semantics (v0.2):** `--cwd` and `--env` are applied in the session
@@ -138,12 +153,17 @@ JSON-RPC (line-delimited), no SDK dependency.
 
 ## Status
 
-v0.2.1 — selftest 19/19. Adds: dead-session job records finalize as 143 everywhere (the
-"stuck running forever" wart), `prune --stale` for session-alive wedged records, and a
-ControlMaster on the inner leg of nested-hop paths (warm hop calls drop from ~2× handshake
-cost to one). v0.2.0 was fleet-tested 2026-09-24 on remote hosts over real ssh:
-**cross-connection env/cwd persistence verified end-to-end**, and the
-multi-path fallback proven in the field — one fleet host was reachable that day only
-through its second-choice relay path, and the sticky-path logic latched onto it
-transparently (`bashd sessions <host>` re-probes every configured path in one call once
-the network heals). Design rationale and tool survey: `docs/RESEARCH.md`.
+v0.3.0 — selftest 20/20. Adds **cost-aware routing with auto re-latch** (per-path `cost`,
+sticky path, detached background probe that promotes a recovered cheap route without
+blocking any call, `bashd paths [--repath]` / `bash_hosts {repath:true}` for state and
+manual probing) and **mid-command failover** (`run` retries its idempotent submit across
+short outages; errors carry a per-path attempt trail; `run`/`wait` report
+`link_drops`/`link_recovered` around route switches). v0.2.1: dead-session job records
+finalize as 143 everywhere (the "stuck running forever" wart), `prune --stale` for
+session-alive wedged records, and a ControlMaster on the inner leg of nested-hop paths
+(warm hop calls drop from ~2× handshake cost to one). v0.2.0 was fleet-tested 2026-09-24
+on remote hosts over real ssh: **cross-connection env/cwd persistence verified
+end-to-end**, and the multi-path fallback proven in the field — one fleet host was
+reachable that day only through its second-choice relay path, and the sticky-path logic
+latched onto it transparently (`bashd sessions <host>` re-probes every configured path in
+one call once the network heals). Design rationale and tool survey: `docs/RESEARCH.md`.

@@ -207,6 +207,16 @@ substrate needs none of this — it reads the real exit code from its code file.
 - **Optional `transport: mosh`** per host for tty sessions on roaming paths (UDP, survives IP
   change wg↔ygg, local echo); ssh remains the default and the only transport for jobs (mosh has no
   exec channel).
+- **Cost-aware routes with auto re-latch (shipped v0.3.0).** Field experience (2026-09-24/26:
+  a fleet host reachable only through its second-choice relay while transit flapped) exposed the
+  last routing gap: the sticky latch has no memory of *preference*, only of *recency* — a
+  recovered cheap path was never promoted back. Fix: per-path `cost` (default = config position),
+  sticky-first then cheapest-first ordering, and a detached background probe spawned after any
+  successful call on a non-cheapest path; it tests the cheaper route (exponential backoff
+  30 s → 15 min, state in `~/.bashd/state.json`) and re-latches it on recovery. Probing never
+  blocks a call; manual forms: `bashd paths [--repath]`, `bash_hosts {repath:true}`. The probe
+  child re-execs the same `bashd` file (`_repath-probe <host>`) with `BASHD_NOPROBE=1` so it
+  cannot recurse.
 
 ### 4.7 Security posture
 

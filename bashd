@@ -11,6 +11,12 @@ Design: https://github.com/.../bashd + docs/RESEARCH.md (summary below).
   timeouts DETACH (never kill). Killing is an explicit `signal`.
 - Transport is system ssh only (ControlMaster, ProxyJump paths, keepalives).
   Ids are client-generated so `start` is idempotent across dropped requests.
+- Routes: every host may list several paths (direct / hop), optionally with a
+  "cost"; calls try the sticky path first, then the rest cheapest-first, and
+  a detached background probe re-latches the cheapest path when it recovers.
+  A mid-execution transport death moves the whole control script to the next
+  path (safe: scripts exec_script runs are idempotent by substrate design —
+  user commands live target-side in tmux + files, never inside the ssh call).
 
 Substrate layout on a target host:
   ~/.bashd/jobs/<id>/run.sh out err code lock pid   (batch jobs)
@@ -32,7 +38,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ENVKEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_MAX_BYTES = 16384      # per-stream bytes returned per read
@@ -42,6 +48,8 @@ ACC_CAP = 262144               # wait()/run() accumulation cap before dropping h
 POLL_LOCAL = 0.2
 POLL_REMOTE = 0.5
 DEFAULT_ULIMIT_MB = 512        # per-stream file size cap for batch jobs (0 = off)
+PROBE_MIN_BACKOFF = 30.0      # s between auto repath probes (doubles on failure)
+PROBE_MAX_BACKOFF = 900.0     # cap for the probe backoff growth
 
 HOME_DIR = os.environ.get("BASHD_HOME", os.path.expanduser("~/.bashd"))
 
@@ -86,21 +94,31 @@ class Host:
         self.name = name
         self.local = name == "local" and not cfg.get("ssh")
         self.ssh = cfg.get("ssh")            # user@host, host, or ssh-config alias
-        # paths: "direct" | ssh-args (str/list) | {"hop": "<ssh-target>",
-        #   "hop_args": "<args for the inner ssh, e.g. -i /path/key>", "target": "<inner dst>"}
+        # paths: "direct" | ssh-args (str/list) | {"args": [..], "cost": n} |
+        #   {"hop": "<ssh-target>", "hop_args": "<inner ssh args, e.g. -i k>",
+        #    "target": "<inner dst>", "cost": n}
+        # "cost" (lower = preferred) may ride on any dict form; default cost =
+        # position, so config order IS the preference order.
         paths = cfg.get("paths") or ["direct"]
         self.paths = []
         for p in paths:
+            cost = p.get("cost") if isinstance(p, dict) else None
+            if cost is not None and not isinstance(cost, (int, float)):
+                raise BashdError("bad path cost %r on host %r (want number)" % (cost, name))
             if p == "direct":
                 self.paths.append({"type": "args", "args": []})
-            elif isinstance(p, dict):
+            elif isinstance(p, dict) and "hop" in p:
                 self.paths.append({"type": "hop", "hop": p["hop"],
                                    "hop_args": shlex.split(p.get("hop_args", "")),
                                    "target": p.get("target") or cfg.get("ssh")})
+            elif isinstance(p, dict) and "args" in p:
+                self.paths.append({"type": "args", "args": [str(x) for x in p["args"]]})
             elif isinstance(p, list):
                 self.paths.append({"type": "args", "args": [str(x) for x in p]})
             else:
                 self.paths.append({"type": "args", "args": shlex.split(str(p))})
+            if cost is not None:
+                self.paths[-1]["cost"] = cost
         c = dict(DEFAULT_CONNECT)
         c.update(cfg.get("connect") or {})
         self.connect = c
@@ -109,9 +127,10 @@ class Host:
 
     def describe(self):
         def rp(p):
-            if p["type"] == "args":
-                return "direct" if not p["args"] else " ".join(p["args"])
-            return "hop via %s -> %s" % (p["hop"], p["target"])
+            d = _path_desc(p)
+            if "cost" in p:
+                d += " (cost %s)" % p["cost"]
+            return d
         return {"name": self.name, "local": self.local, "ssh": self.ssh,
                 "paths": [rp(p) for p in self.paths],
                 "connect": self.connect, "defaults": self.defaults, "notes": self.notes}
@@ -160,6 +179,97 @@ def note_sticky_path(host, idx):
 
 def sticky_path_idx(host):
     return load_state().get("path", {}).get(host.name)
+
+
+def _path_desc(p):
+    if p["type"] == "args":
+        return "direct" if not p["args"] else " ".join(p["args"])
+    return "hop via %s -> %s" % (p["hop"], p["target"])
+
+
+def cheapest_path_idx(host):
+    """Cost wins; config position breaks ties (unset cost = position)."""
+    return min(range(len(host.paths)),
+               key=lambda i: (host.paths[i].get("cost", i), i))
+
+
+def _arm_probe(host, failed):
+    st = load_state()
+    pr = (st.get("probe") or {}).get(host.name) or {}
+    if failed:
+        b = min(max(pr.get("backoff", PROBE_MIN_BACKOFF) * 2, PROBE_MIN_BACKOFF),
+                PROBE_MAX_BACKOFF)
+    else:
+        b = PROBE_MIN_BACKOFF
+    st.setdefault("probe", {})[host.name] = {"backoff": b, "next_ts": time.time() + b}
+    save_state(st)
+
+
+def maybe_spawn_repath_probe(host):
+    """After a successful call on a non-cheapest path, fire a detached probe
+    that re-latches the cheapest path once it has recovered. Never blocks the
+    call; rate-limited via state.json (exponential backoff on probe failures)."""
+    if host.local or len(host.paths) < 2 or os.environ.get("BASHD_NOPROBE"):
+        return
+    st = load_state()
+    si = (st.get("path") or {}).get(host.name)
+    if si is None or si == cheapest_path_idx(host):
+        return
+    pr = (st.get("probe") or {}).get(host.name) or {}
+    if time.time() < pr.get("next_ts", 0):
+        return
+    pr["next_ts"] = time.time() + PROBE_MIN_BACKOFF  # dedupe gate; child re-arms
+    st.setdefault("probe", {})[host.name] = pr
+    save_state(st)
+    env = dict(os.environ, BASHD_HOME=HOME_DIR, BASHD_NOPROBE="1")
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__),
+                          "_repath-probe", host.name],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, env=env)
+    except OSError:
+        pass
+
+
+def _try_path(host, idx):
+    """Single-path connectivity probe: true iff the path runs a trivial script."""
+    argv = _ssh_argv_for_path(host, host.paths[idx]) + ["sh", "-s"]
+    t = host.connect["timeout_s"] * 2 + 5
+    try:
+        p = subprocess.run(argv, input=b"echo BASHD_PATH_OK", stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=t)
+    except subprocess.TimeoutExpired:
+        return False, "timeout after %ss" % t
+    if p.returncode == 0 and b"BASHD_PATH_OK" in p.stdout:
+        return True, ""
+    err = p.stderr.decode("utf-8", "replace").strip()
+    return False, (err.splitlines()[-1] if err else "rc=%s" % p.returncode)[:200]
+
+
+def repath_probe(host):
+    """Probe paths cheaper than the current sticky one (cheapest first) and
+    re-latch the first that connects. Used by the background probe and by
+    `bashd paths --repath` / bash_hosts repath=true."""
+    if host.local:
+        return {"host": host.name, "action": "local"}
+    if len(host.paths) < 2:
+        return {"host": host.name, "action": "noop"}
+    si = load_state().get("path", {}).get(host.name)
+    if si is not None and si == cheapest_path_idx(host):
+        return {"host": host.name, "action": "no_change", "sticky": si,
+                "reason": "already on cheapest path"}
+    order = sorted(range(len(host.paths)),
+                   key=lambda i: (host.paths[i].get("cost", i), i))
+    for idx in order:
+        if idx == si:
+            break  # reached the sticky path without finding anything cheaper
+        ok, err = _try_path(host, idx)
+        if ok:
+            note_sticky_path(host, idx)
+            _arm_probe(host, failed=False)
+            return {"host": host.name, "action": "relatched", "path": idx, "from": si}
+    _arm_probe(host, failed=True)
+    return {"host": host.name, "action": "no_change", "sticky": si}
 
 
 # ---------------------------------------------------------------- transport
@@ -213,7 +323,11 @@ def _ssh_argv_for_path(host, path):
 
 def exec_script(host, script, timeout_s):
     """Run a POSIX sh script on the target. Returns (rc, stdout, stderr).
-    Raises Unreachable if no path connects. For host 'local' runs locally."""
+    Paths are tried sticky-first then cheapest-first; a mid-execution transport
+    death retries the whole script on the next path (safe: every script run
+    here is idempotent by substrate design — user commands live target-side in
+    tmux + files, never inside the ssh call). Failures carry the per-path
+    attempt trail. Raises Unreachable if no path connects. 'local' runs locally."""
     if host.local:
         try:
             p = subprocess.run(["/bin/sh", "-s"], input=script.encode(),
@@ -223,13 +337,14 @@ def exec_script(host, script, timeout_s):
             raise BashdError("local exec timed out after %ss" % timeout_s)
         return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
-    order = []
     si = sticky_path_idx(host)
+    order = []
     if si is not None and 0 <= si < len(host.paths):
         order.append(si)
-    order += [i for i in range(len(host.paths)) if i not in order]
+    order += sorted((i for i in range(len(host.paths)) if i not in order),
+                    key=lambda i: (host.paths[i].get("cost", i), i))
 
-    last_err, last_unreach = None, None
+    last_err, last_unreach, attempts = None, None, []
     for idx in order:
         argv = _ssh_argv_for_path(host, host.paths[idx]) + ["sh", "-s"]
         try:
@@ -237,26 +352,32 @@ def exec_script(host, script, timeout_s):
                                stderr=subprocess.PIPE,
                                timeout=max(timeout_s, host.connect["timeout_s"] * 2 + 5))
         except subprocess.TimeoutExpired:
+            attempts.append("path%d:timeout" % idx)
             last_err = "path %d timed out" % idx
             continue
         out = p.stdout.decode("utf-8", "replace")
         err = p.stderr.decode("utf-8", "replace")
         if p.returncode == 0:
             note_sticky_path(host, idx)
+            maybe_spawn_repath_probe(host)
             return 0, out, err
         if p.returncode == 255 and _UNREACHABLE_PAT.search(err):
+            attempts.append("path%d:unreachable" % idx)
             last_unreach = "path %d: %s" % (idx, err.strip().splitlines()[-1] if err.strip() else "unreachable")
             continue
         # auth error, host key, remote sh failure (rc from remote sh propagates as
         # 255? no: remote rc comes through as-is for exec; 255 is ssh itself)
         if p.returncode == 255:
+            attempts.append("path%d:ssh-error" % idx)
             last_err = "ssh error on path %d: %s" % (idx, err.strip()[-300:])
         else:
             note_sticky_path(host, idx)
+            maybe_spawn_repath_probe(host)
             return p.returncode, out, err
+    trail = " [attempts: %s]" % "; ".join(attempts) if attempts else ""
     if last_unreach:
-        raise Unreachable("%s unreachable (%s)" % (host.name, last_unreach))
-    raise BashdError("%s: %s" % (host.name, last_err or "all paths failed"))
+        raise Unreachable("%s unreachable (%s)%s" % (host.name, last_unreach, trail))
+    raise BashdError("%s: %s%s" % (host.name, last_err or "all paths failed", trail))
 
 
 # ---------------------------------------------------------------- ids
@@ -630,11 +751,26 @@ def do_run(host, cmd, timeout_s=120, max_bytes=DEFAULT_MAX_BYTES, cwd=None, env=
         return job_start(host, "previewid", cmd, cwd, env, ulimit_mb, session=session, dry_run=True)
     jid = jid or new_id()
     t0 = time.time()
-    state = job_start(host, jid, cmd, cwd, env, ulimit_mb, session=session)
+    # Mid-command failover at entry: if every path is down right now, keep
+    # retrying the submit for a short grace — it is idempotent by id, and the
+    # substrate tolerates it landing late.
+    grace = min(15.0, max(1.0, timeout_s))
+    submit_retries = 0
+    while True:
+        try:
+            state = job_start(host, jid, cmd, cwd, env, ulimit_mb, session=session)
+            break
+        except Unreachable:
+            if time.time() - t0 >= grace:
+                raise
+            submit_retries += 1
+            time.sleep(1.0)
     res = {"ok": True, "id": "%s:%s" % (host.name, jid), "host": host.name,
            "start_state": state, "status": "running", "exit_code": None,
            "stdout": "", "stderr": "", "cursor_out": 0, "cursor_err": 0,
            "duration_s": None, "timed_out": False, "note": host.notes}
+    if submit_retries:
+        res["submit_retries"] = submit_retries
     if state == "done-exists":
         r = job_read(host, jid, 0, 0, max_bytes * 4)
         res.update(status=r["status"], exit_code=r["exit_code"], stdout=r["stdout"],
@@ -642,16 +778,23 @@ def do_run(host, cmd, timeout_s=120, max_bytes=DEFAULT_MAX_BYTES, cwd=None, env=
         return res
     poll = POLL_LOCAL if host.local else POLL_REMOTE
     acc_o = acc_e = ""
+    link_drops = 0
     while True:
         time.sleep(poll)
         try:
             r = job_read(host, jid, res["cursor_out"], res["cursor_err"], READ_CHUNK)
         except (Unreachable, BashdError) as e:
+            link_drops += 1
             if time.time() - t0 >= timeout_s:
                 res["dropped_link"] = str(e)
+                res["link_drops"] = link_drops
                 break
-            time.sleep(1.0)
+            time.sleep(min(1.0 * link_drops, 5.0))
             continue
+        if link_drops:
+            res["link_recovered"] = True
+            res["link_drops"] = link_drops
+            link_drops = 0
         res["cursor_out"], res["cursor_err"] = r["cursor_out"], r["cursor_err"]
         acc_o += r["stdout"]
         acc_e += r["stderr"]
@@ -716,6 +859,7 @@ def do_wait(host, kind, key, timeout_s=120, until="exit", pattern=None, idle_s=2
     match = None
     poll = POLL_LOCAL if host.local else POLL_REMOTE
     backoff = 1.0
+    link_drops = 0
     status = "running"
     while True:
         if entry_unreachable is not None:
@@ -746,9 +890,12 @@ def do_wait(host, kind, key, timeout_s=120, until="exit", pattern=None, idle_s=2
                 alive = r["alive"]
             backoff = 1.0
         except (Unreachable, BashdError) as e:
+            link_drops += 1
             if time.time() >= deadline:
                 res = {"ok": True, "status": "running", "link_lost": True,
                        "link_error": str(e), "waited_s": round(time.time() - t0, 2)}
+                if link_drops:
+                    res["link_drops"] = link_drops
                 return _wait_result(res, acc, max_bytes, match)
             time.sleep(min(backoff, max(0.1, deadline - time.time())))
             backoff = min(backoff * 2, 5)
@@ -777,6 +924,9 @@ def do_wait(host, kind, key, timeout_s=120, until="exit", pattern=None, idle_s=2
     else:
         status = "running"
     res = {"ok": True, "status": status, "exit_code": code, "waited_s": waited}
+    if link_drops:
+        res["link_drops"] = link_drops
+        res["link_recovered"] = True
     return _wait_result(res, acc, max_bytes, match)
 
 
@@ -947,6 +1097,31 @@ def do_hosts():
     return {"ok": True, "hosts": [h.describe() for _, h in sorted(load_config().items())]}
 
 
+def do_paths(host_name=None, repath=False):
+    """Per-host route table: paths with costs, sticky/cheapest, probe state.
+    repath=True probes paths cheaper than the current sticky one right now."""
+    hosts = load_config()
+    targets = {host_name: get_host(host_name, hosts)} if host_name else hosts
+    res = {"ok": True, "hosts": []}
+    for name in sorted(targets):
+        h = targets[name]
+        rep = repath_probe(h) if (repath and not h.local and len(h.paths) > 1) else None
+        st = load_state()
+        si = (st.get("path") or {}).get(name)
+        pr = (st.get("probe") or {}).get(name) or {}
+        entry = {"host": name, "local": h.local, "sticky": si,
+                 "cheapest": cheapest_path_idx(h),
+                 "probe_backoff_s": pr.get("backoff"),
+                 "probe_next_in_s": (round(pr["next_ts"] - time.time(), 1)
+                                     if pr.get("next_ts") else None),
+                 "paths": [{"idx": i, "cost": p.get("cost", i), "sticky": i == si,
+                            "desc": _path_desc(p)} for i, p in enumerate(h.paths)]}
+        if rep:
+            entry["repath"] = rep
+        res["hosts"].append(entry)
+    return res
+
+
 # ---------------------------------------------------------------- MCP server
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -1046,15 +1221,20 @@ def mcp_tools():
          "inputSchema": _schema({"host": _s("string", "Host alias"),
                                  "stale_s": _s("number", "Reap jobs quiet for this many seconds")},
                                 ["host"])},
-        {"name": "bash_hosts", "description": "Show the host registry (aliases, paths, notes, defaults).",
-         "inputSchema": _schema({})},
+        {"name": "bash_hosts", "description":
+            "Show the host registry (aliases, paths with cost, notes, defaults) plus the "
+            "per-host route state: sticky path in use, cheapest path, repath-probe backoff. "
+            "repath=true: probe paths cheaper than the current sticky one and re-latch the "
+            "first that connects (normally the background probe does this automatically).",
+         "inputSchema": _schema({"host": _s("string", "Restrict to one host alias"),
+                                 "repath": _s("boolean", "Probe cheaper paths now")})},
     ]
 
 
 def mcp_dispatch(name, args):
     hosts = load_config()
     if name == "bash_hosts":
-        return do_hosts()
+        return do_paths(args.get("host"), bool(args.get("repath")))
     if name == "bash_sessions":
         return do_sessions(args.get("host"), hosts)
     if name == "bash_prune":
@@ -1155,6 +1335,10 @@ def _print(res):
 
 def cli_hosts(_a):
     _print(do_hosts())
+
+
+def cli_paths(a):
+    _print(do_paths(a.host or None, repath=a.repath))
 
 
 def cli_sessions(a):
@@ -1276,6 +1460,16 @@ def build_parser():
 
     p = sub.add_parser("hosts", help="show host registry")
     p.set_defaults(fn=cli_hosts)
+
+    p = sub.add_parser("paths", help="per-host route table (cost / sticky / repath-probe state)")
+    p.add_argument("host", nargs="?")
+    p.add_argument("--repath", action="store_true",
+                   help="probe paths cheaper than the sticky one now, re-latch the first that works")
+    p.set_defaults(fn=cli_paths)
+
+    p = sub.add_parser("_repath-probe", help=argparse.SUPPRESS)
+    p.add_argument("host")
+    p.set_defaults(fn=lambda a: _print(repath_probe(get_host(a.host))))
 
     p = sub.add_parser("mcp", help="run as MCP stdio server")
     p.set_defaults(fn=lambda a: mcp_server())
@@ -1480,6 +1674,88 @@ def selftest():
         r = do_run(h, "echo hop_ok", timeout_s=30)
         assert r["status"] == "done" and r["stdout"].strip() == "hop_ok", r
     check("nested hop path (mux on both legs)", t_hop)
+
+    def t_repath():
+        # cost-aware routing: cheap path 0 behind a shimmed ssh we can kill,
+        # expensive path 1; sync repath, background auto re-latch, attempt trace
+        bindir = os.path.join(tmp, "shim-bin")
+        os.makedirs(bindir, exist_ok=True)
+        shim = os.path.join(bindir, "ssh")
+        with open(shim, "w") as f:
+            f.write('#!/bin/sh\n'
+                    'if [ "$BASHD_SHIM_MODE" = "deadall" ]; then\n'
+                    '  echo "ssh: connect to host 203.0.113.7 port 22: Connection refused" >&2\n'
+                    '  exit 255\n'
+                    'fi\n'
+                    'for a in "$@"; do\n'
+                    '  if [ "$a" = "PATH0MARK" ] && [ "$BASHD_SHIM_MODE" = "dead0" ]; then\n'
+                    '    echo "ssh: connect to host 203.0.113.7 port 22: Connection refused" >&2\n'
+                    '    exit 255\n'
+                    '  fi\n'
+                    'done\n'
+                    'exec /bin/sh -s\n')
+        os.chmod(shim, 0o755)
+        old_path = os.environ.get("PATH")
+        os.environ["PATH"] = bindir + os.pathsep + (old_path or "")
+        old_shim = os.environ.pop("BASHD_SHIM_MODE", None)
+        try:
+            cfg = {"ssh": "shimhost",
+                   "paths": [{"args": ["PATH0MARK"], "cost": 1}, "direct"]}
+            try:
+                Host("badcost", {"paths": [{"cost": "cheap"}]})
+                raise AssertionError("bad cost accepted")
+            except BashdError:
+                pass
+            with open(os.path.join(HOME_DIR, "hosts.json"), "w") as f:
+                json.dump({"hosts": {"local": {}, "pathtest": cfg}}, f)
+            h = Host("pathtest", cfg)
+
+            os.environ["BASHD_SHIM_MODE"] = "dead0"
+            r = do_run(h, "echo via1", timeout_s=25, jid=stid())
+            assert r["status"] == "done" and r["stdout"].strip() == "via1", r
+            assert sticky_path_idx(h) == 1, sticky_path_idx(h)  # fell over to the expensive path
+
+            dp = do_paths("pathtest")["hosts"][0]
+            assert dp["cheapest"] == 0 and dp["paths"][0]["cost"] == 1, dp
+
+            os.environ["BASHD_SHIM_MODE"] = "ok"
+            rep = repath_probe(h)
+            assert rep["action"] == "relatched" and rep["path"] == 0, rep
+            assert sticky_path_idx(h) == 0
+            assert repath_probe(h)["reason"] == "already on cheapest path"
+
+            # background auto-probe: sticky back on the expensive path, cheap
+            # path alive again, probe gate open -> a detached child re-latches
+            note_sticky_path(h, 1)
+            stt = load_state()
+            stt.setdefault("probe", {})["pathtest"] = {"backoff": 5, "next_ts": 0}
+            save_state(stt)
+            maybe_spawn_repath_probe(h)
+            for _ in range(60):
+                if sticky_path_idx(h) == 0:
+                    break
+                time.sleep(0.1)
+            assert sticky_path_idx(h) == 0, \
+                "background probe did not re-latch: %s" % load_state()
+
+            # total outage: error carries the per-path attempt trail
+            os.environ["BASHD_SHIM_MODE"] = "deadall"
+            try:
+                exec_script(h, "echo x", 10)
+                raise AssertionError("expected Unreachable")
+            except Unreachable as e:
+                assert "path0:unreachable" in str(e) and "path1:unreachable" in str(e), e
+        finally:
+            os.environ.pop("BASHD_SHIM_MODE", None)
+            if old_shim is not None:
+                os.environ["BASHD_SHIM_MODE"] = old_shim
+            if old_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = old_path
+            with open(os.path.join(HOME_DIR, "hosts.json"), "w") as f:
+                json.dump({"hosts": {"local": {}}}, f)
+    check("cost-aware repath (sync + background) + attempt trail", t_repath)
 
     def t_prune():
         h = get_host("local", load_config())
