@@ -26,11 +26,13 @@ no work and no output; every call reconnects and resumes by byte cursor.
 - **Cursor reads.** `read` returns bytes since a byte offset, plus status and exit code in
   one round trip. Reconnects replay from the last confirmed cursor — no gaps, no duplicates.
 - **Events = blocking wait.** `wait` blocks until `exit` / `regex` / `idle`, tolerates link
-  drops mid-wait, and fails fast with `tried_paths` when a host is down at entry. A dead
-  session (e.g. someone ran `exit`) is reported as `dead`; the next call auto-recreates it.
-- **Transport is system ssh only.** ControlMaster reuse, `ServerAlive` keepalives, ordered
-  multi-path fallback (direct / args overrides / nested hops), host aliases resolved through
-  your normal ssh config. No paramiko.
+  drops mid-wait, and fails fast with `tried_paths` when a host is down at entry. A job
+  whose session died under it (target reboot, killed session, bare `exit`) is finalized as
+  exit `143` on the next read — it never lingers as an eternal "running" record.
+- **Transport is system ssh only.** ControlMaster reuse on *both* legs of a nested hop (the
+  inner leg keeps its own mux socket on the relay, so warm calls skip the inner handshake),
+  `ServerAlive` keepalives, ordered multi-path fallback (direct / args overrides / nested
+  hops), host aliases resolved through your normal ssh config. No paramiko.
 - **Host registry with notes.** `~/.bashd/hosts.json` maps aliases to connection details and
   per-host notes that ride along in every response (fleet gotchas become first-class metadata).
 
@@ -92,8 +94,9 @@ bashd write web:tty:ops 'sudo journalctl -u nginx -n 50'
 bashd read web:tty:ops --screen                # live pane
 bashd sessions                                 # fleet overview, parallel, fail-fast
 bashd prune web                                # remove finished job records + dead tty logs
+bashd prune web --stale 3600                   # also reap codeless jobs quiet 1h (wedged, session alive)
 bashd hosts                                    # show registry
-bashd selftest                                 # 17 end-to-end checks
+bashd selftest                                 # 19 end-to-end checks
 ```
 
 **Persistent-environment semantics (v0.2):** `--cwd` and `--env` are applied in the session
@@ -127,14 +130,19 @@ JSON-RPC (line-delimited), no SDK dependency.
   runaway commands can't fill the target's disk while unwatched.
 - One command at a time per session (extras queue in the shell — order preserved).
 - Sessions survive any disconnect but not a target reboot (tmux dies; job records persist
-  and stale entries are closed as 143 when the session is re-created).
+  and are finalized as 143 — on read, on `sessions`, and at prune — so nothing lingers as
+  "running" forever). `prune --stale SECONDS` additionally reaps codeless records whose
+  output has been quiet that long while their session is still alive (wedged session;
+  opt-in — a legitimately silent long run could match).
 - `HOME` on targets must be slash-free (standard on Linux) — pipe-pane log paths rely on it.
 
 ## Status
 
-v0.2.0 — selftest 17/17 (incl. env/cwd persistence, session isolation, `exit`-hazard
-auto-recovery, MCP roundtrip, nested-hop, prune). Fleet-tested 2026-09-24 on remote hosts
-over real ssh: **cross-connection env/cwd persistence verified end-to-end**, and the
+v0.2.1 — selftest 19/19. Adds: dead-session job records finalize as 143 everywhere (the
+"stuck running forever" wart), `prune --stale` for session-alive wedged records, and a
+ControlMaster on the inner leg of nested-hop paths (warm hop calls drop from ~2× handshake
+cost to one). v0.2.0 was fleet-tested 2026-09-24 on remote hosts over real ssh:
+**cross-connection env/cwd persistence verified end-to-end**, and the
 multi-path fallback proven in the field — one fleet host was reachable that day only
 through its second-choice relay path, and the sticky-path logic latched onto it
 transparently (`bashd sessions <host>` re-probes every configured path in one call once

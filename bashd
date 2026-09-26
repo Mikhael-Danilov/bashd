@@ -32,7 +32,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ENVKEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_MAX_BYTES = 16384      # per-stream bytes returned per read
@@ -192,9 +192,21 @@ def _ssh_argv_for_path(host, path):
     """Full argv up to (not including) the remote command, for a normalized path.
     exec_script appends the remote command (`sh -s`) uniformly."""
     if path["type"] == "hop":
-        inner = (["ssh"] + path["hop_args"] +
-                 ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-                  path["target"]])
+        # The inner ssh runs on the hop host: give it its own ControlMaster
+        # (relative ControlPath -> socket in the hop shell's cwd, i.e. ~hopper)
+        # and keepalives, or every call re-pays the inner handshake — brutal on
+        # slow relay paths. Generic opts first so hop_args can override.
+        c = host.connect
+        inner = ["ssh", "-o", "BatchMode=yes",
+                 "-o", "StrictHostKeyChecking=accept-new",
+                 "-o", "ServerAliveInterval=%s" % c["keepalive_s"],
+                 "-o", "ServerAliveCountMax=%s" % c["keepalive_max"]]
+        if c["control_master"]:
+            inner += ["-o", "ControlMaster=auto",
+                      "-o", "ControlPath=.bashd-cm-%C",
+                      "-o", "ControlPersist=600"]
+        inner += path["hop_args"]
+        inner.append(path["target"])
         return _ssh_opts(host) + [path["hop"]] + inner
     return _ssh_opts(host) + path["args"] + [host.ssh]
 
@@ -267,6 +279,9 @@ def parse_id(jid):
 ENVELOPE_FMT = ('printf \'{"out_size":%s,"err_size":%s,"code":"%s","alive":%s,'
                 '"out":"%s","err":"%s"}\\n\' "$o" "$e" "$c" "$a" "$ob" "$eb"')
 
+# A codeless job whose session is gone can never finish (target reboot, killed
+# session) — the read stamps it 143 so it stops showing as "running" forever.
+# The lock check leaves half-created dirs (crash mid-submit) untouched.
 JOB_READ_TMPL = r'''
 umask 077
 d="$HOME/.bashd/jobs/__ID__"
@@ -277,6 +292,9 @@ o=0; e=0; c="-"; a=1
 [ -f "$d/code" ] && c=$(cat "$d/code")
 S=$(cat "$d/session" 2>/dev/null)
 if [ -n "$S" ] && ! tmux -L bashd has-session -t $S 2>/dev/null; then a=0; fi
+if [ "$c" = "-" ] && [ -f "$d/lock" ] && { [ "$a" = 0 ] || [ -z "$S" ]; }; then
+  echo 143 > "$d/code"; c=143; a=0
+fi
 ob=$(tail -c +$((__CO__ + 1)) "$d/out" 2>/dev/null | head -c __MAX__ | base64 | tr -d "\n")
 eb=$(tail -c +$((__CE__ + 1)) "$d/err" 2>/dev/null | head -c __MAX__ | base64 | tr -d "\n")
 ''' + ENVELOPE_FMT + "\n"
@@ -379,15 +397,22 @@ fi
 SESSIONS_TMPL = r'''
 umask 077
 echo "BASHD_JOBS"
+tmux -L bashd list-sessions -F '#S' 2>/dev/null | sort > /tmp/.bashd_sess.$$ || : > /tmp/.bashd_sess.$$
 for d in "$HOME"/.bashd/jobs/*/; do
   [ -d "$d" ] || continue
   c="-"; [ -f "$d/code" ] && c=$(cat "$d/code")
   s="-"; [ -f "$d/session" ] && s=$(cat "$d/session")
+  if [ "$c" = "-" ] && [ -f "$d/lock" ]; then
+    if [ "$s" = "-" ] || ! grep -qx "$s" /tmp/.bashd_sess.$$; then
+      echo 143 > "$d/code"; c=143
+    fi
+  fi
   o=0; e=0
   [ -f "$d/out" ] && o=$(wc -c < "$d/out" | tr -d " ")
   [ -f "$d/err" ] && e=$(wc -c < "$d/err" | tr -d " ")
   printf '%s\t%s\t%s\t%s\t%s\n' "$(basename "$d")" "$c" "$o" "$e" "$s"
 done
+rm -f /tmp/.bashd_sess.$$
 echo "BASHD_TTYS"
 tmux -L bashd list-sessions -F '#S' 2>/dev/null || true
 echo "BASHD_TTYLOGS"
@@ -863,18 +888,30 @@ def do_sessions(host_name=None, hosts=None):
     return {"ok": True, "hosts": results}
 
 
-def do_prune(host, host_name, dry_run=False):
-    """Remove finished job dirs (code file present) and tty logs whose tmux
-    session is dead. Running jobs and live sessions are never touched."""
+def do_prune(host, host_name, dry_run=False, stale_s=None):
+    """Remove finished job dirs and tty logs whose tmux session is dead.
+    Before removal, a codeless job whose session is gone is finalized as 143
+    (it can never finish: target reboot or killed session). With stale_s, a
+    codeless job whose out/err have BOTH been quiet for stale_s seconds is
+    finalized too — the session-alive-but-wedged case; opt-in because a
+    legitimately silent long run could match."""
     script = r'''
 umask 077
 n=0
+tmux -L bashd list-sessions -F '#S' 2>/dev/null | sort > /tmp/.bashd_alive.$$ || : > /tmp/.bashd_alive.$$
+__STALE_INIT__
 for d in "$HOME"/.bashd/jobs/*/; do
   [ -d "$d" ] || continue
+  if [ ! -f "$d/code" ] && [ -f "$d/lock" ]; then
+    s=$(cat "$d/session" 2>/dev/null)
+    dead=0
+    if [ -z "$s" ] || ! grep -qx "$s" /tmp/.bashd_alive.$$; then dead=1; fi
+__STALE_CHECK__
+    [ "$dead" = 1 ] && echo 143 > "$d/code"
+  fi
   if [ -f "$d/code" ]; then rm -rf "$d" && n=$((n+1)); fi
 done
 t=0
-tmux -L bashd list-sessions -F '#S' 2>/dev/null | sort > /tmp/.bashd_alive.$$
 for l in "$HOME"/.bashd/tmux/*.log; do
   [ -f "$l" ] || continue
   b=$(basename "$l" .log)
@@ -883,14 +920,27 @@ done
 rm -f /tmp/.bashd_alive.$$
 echo "BASHD_PRUNED jobs=$n logs=$t"
 '''
+    if stale_s:
+        script = script.replace(
+            "__STALE_INIT__",
+            'ref="/tmp/.bashd_stale.$$"; '
+            'touch -d "@$(( $(date +%s) - __STALE_SECS__ ))" "$ref" 2>/dev/null || ref=""; '
+        ).replace("__STALE_SECS__", str(max(1, int(stale_s)))).replace(
+            "__STALE_CHECK__",
+            '    if [ "$dead" = 0 ] && [ -n "$ref" ] && [ "$d/out" -ot "$ref" ] '
+            '&& [ "$d/err" -ot "$ref" ]; then dead=1; fi\n')
+    script = script.replace("__STALE_INIT__", "").replace("__STALE_CHECK__", "")
     if dry_run:
         return {"dry_run": exec_argv_preview(host, script)}
     out = exec_script(host, script, timeout_s=60)[1]
     m = re.search(r"BASHD_PRUNED jobs=(\d+) logs=(\d+)", out)
     if not m:
         raise BashdError("prune: unexpected output from %s" % host_name)
-    return {"ok": True, "host": host_name, "jobs_removed": int(m.group(1)),
-            "tty_logs_removed": int(m.group(2))}
+    res = {"ok": True, "host": host_name, "jobs_removed": int(m.group(1)),
+           "tty_logs_removed": int(m.group(2))}
+    if stale_s:
+        res["stale_s"] = int(stale_s)
+    return res
 
 
 def do_hosts():
@@ -989,8 +1039,13 @@ def mcp_tools():
          "inputSchema": _schema({"host": _s("string", "Restrict to one host alias")})},
         {"name": "bash_prune", "description":
             "Remove finished batch-job records and tty logs of dead sessions from a host's "
-            "~/.bashd (running jobs and live sessions are never touched).",
-         "inputSchema": _schema({"host": _s("string", "Host alias")}, ["host"])},
+            "~/.bashd (live sessions are never touched). Codeless jobs whose session is "
+            "gone are finalized as exit 143 first. stale_s (optional): also reap codeless "
+            "jobs whose output has been quiet this many seconds while their session is "
+            "still alive — opt-in, a silent long run could match.",
+         "inputSchema": _schema({"host": _s("string", "Host alias"),
+                                 "stale_s": _s("number", "Reap jobs quiet for this many seconds")},
+                                ["host"])},
         {"name": "bash_hosts", "description": "Show the host registry (aliases, paths, notes, defaults).",
          "inputSchema": _schema({})},
     ]
@@ -1004,7 +1059,7 @@ def mcp_dispatch(name, args):
         return do_sessions(args.get("host"), hosts)
     if name == "bash_prune":
         h = get_host(args.get("host", "local"), hosts)
-        return do_prune(h, h.name)
+        return do_prune(h, h.name, stale_s=args.get("stale_s"))
     if name == "bash_run":
         h = get_host(args.get("host", "local"), hosts)
         return do_run(h, args["cmd"], float(args.get("timeout_s", 120)),
@@ -1144,7 +1199,7 @@ def cli_signal(a):
 
 def cli_prune(a):
     h = get_host(a.host)
-    _print(do_prune(h, h.name, a.dry_run))
+    _print(do_prune(h, h.name, a.dry_run, stale_s=a.stale_s))
 
 
 def _kv(pairs):
@@ -1213,6 +1268,9 @@ def build_parser():
 
     p = sub.add_parser("prune", help="remove finished job records + dead tty logs on a host")
     p.add_argument("host")
+    p.add_argument("--stale", dest="stale_s", type=float, default=None,
+                   help="also reap codeless jobs quiet this many seconds "
+                        "(session alive but wedged; opt-in)")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cli_prune)
 
@@ -1334,11 +1392,13 @@ def selftest():
     check("wait until=idle + signal ctrl-c (130)", t_idle)
 
     def t_exit_hazard():
+        # v0.2.1: the read finalizes the orphaned record as 143 ("terminated,
+        # exact code unrecorded") instead of reporting an open-ended "dead"
         r = do_run(H, "exit 0", timeout_s=15, jid=stid())
-        assert r["status"] == "dead" and r["exit_code"] is None, r
+        assert r["status"] == "done" and r["exit_code"] == 143, r
         r2 = do_run(H, "echo recovered", timeout_s=20, jid=stid())
         assert r2["status"] == "done" and r2["stdout"].strip() == "recovered", r2
-    check("`exit` kills session; session auto-recreates", t_exit_hazard)
+    check("`exit` kills session; record finalized 143; auto-recreates", t_exit_hazard)
 
     def t_notfound():
         try:
@@ -1415,9 +1475,11 @@ def selftest():
             print("SKIP hop test (no ssh self-auth)")
             return
         h = Host("hoptest", {"ssh": "127.0.0.1", "paths": [{"hop": "127.0.0.1"}]})
+        argv = _ssh_argv_for_path(h, h.paths[0])
+        assert argv.count("ControlMaster=auto") == 2, argv  # outer + inner legs
         r = do_run(h, "echo hop_ok", timeout_s=30)
         assert r["status"] == "done" and r["stdout"].strip() == "hop_ok", r
-    check("nested hop path", t_hop)
+    check("nested hop path (mux on both legs)", t_hop)
 
     def t_prune():
         h = get_host("local", load_config())
@@ -1428,6 +1490,31 @@ def selftest():
         r = do_prune(h, "local")
         assert r["jobs_removed"] >= 1, r
     check("prune finished jobs", t_prune)
+
+    def t_finalize():
+        # kill the session out from under a running job: the record must come
+        # back finalized (143) from the next read, and prune must sweep it
+        sess = "st" + secrets.token_hex(3)
+        jid = stid()
+        job_start(H, jid, "echo soon; sleep 30", session=sess)
+        time.sleep(1.0)
+        exec_script(H, "tmux -L bashd kill-session -t %s" % sess, 10)
+        r = job_read(H, jid)
+        assert r["status"] == "done" and r["exit_code"] == 143, r
+        assert "soon" in r["stdout"], r
+        do_prune(H, "local")
+        exec_script(H, "test ! -d \"$HOME/.bashd/jobs/%s\"" % jid, 10)
+    check("dead session finalizes job as 143 on read", t_finalize)
+
+    def t_prune_stale():
+        # session-alive but wedged: opt-in reaping by output quiet time
+        sess = "st" + secrets.token_hex(3)
+        jid = stid()
+        job_start(H, jid, "echo quiet_test; sleep 8", session=sess)
+        time.sleep(1.6)  # out/err mtimes now ~1.5 s old
+        r = do_prune(H, "local", stale_s=1)
+        exec_script(H, "test ! -d \"$HOME/.bashd/jobs/%s\"" % jid, 10)
+    check("prune --stale reaps quiet codeless jobs", t_prune_stale)
 
     def t_cleanup():
         # selftest jobs live on the real local substrate (~/.bashd) — remove our st* artifacts
