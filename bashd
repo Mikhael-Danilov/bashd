@@ -19,7 +19,8 @@ Design: https://github.com/.../bashd + docs/RESEARCH.md (summary below).
   user commands live target-side in tmux + files, never inside the ssh call).
 
 Substrate layout on a target host:
-  ~/.bashd/jobs/<id>/run.sh out err code lock pid   (batch jobs)
+  ~/.bashd/jobs/<id>/run out err code lock session (batch jobs; the lock is
+    held (flock) for the job's whole execution — the liveness marker)
   ~/.bashd/tmux/<name>.log                          (tty session pipe-pane log)
 """
 
@@ -38,7 +39,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ENVKEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_MAX_BYTES = 16384      # per-stream bytes returned per read
@@ -50,6 +51,7 @@ POLL_REMOTE = 0.5
 DEFAULT_ULIMIT_MB = 512        # per-stream file size cap for batch jobs (0 = off)
 PROBE_MIN_BACKOFF = 30.0      # s between auto repath probes (doubles on failure)
 PROBE_MAX_BACKOFF = 900.0     # cap for the probe backoff growth
+ORPHAN_GRACE_S = 900          # a codeless job younger than this is never orphan-finalized
 
 HOME_DIR = os.environ.get("BASHD_HOME", os.path.expanduser("~/.bashd"))
 
@@ -403,6 +405,11 @@ ENVELOPE_FMT = ('printf \'{"out_size":%s,"err_size":%s,"code":"%s","alive":%s,'
 # A codeless job whose session is gone can never finish (target reboot, killed
 # session) — the read stamps it 143 so it stops showing as "running" forever.
 # The lock check leaves half-created dirs (crash mid-submit) untouched.
+# v0.3.1 orphan rule: even with the session alive, a codeless job whose lock
+# nobody holds, whose files are all older than ORPHAN_GRACE_S and whose session
+# has no executing job (a held lock) is dead — its submit lines were lost
+# (queued tty input can be discarded by the terminal / readline while the
+# shell is busy). Pre-grace and held-lock cases are never touched.
 JOB_READ_TMPL = r'''
 umask 077
 d="$HOME/.bashd/jobs/__ID__"
@@ -411,10 +418,28 @@ o=0; e=0; c="-"; a=1
 [ -f "$d/out" ] && o=$(wc -c < "$d/out" | tr -d " ")
 [ -f "$d/err" ] && e=$(wc -c < "$d/err" | tr -d " ")
 [ -f "$d/code" ] && c=$(cat "$d/code")
-S=$(cat "$d/session" 2>/dev/null)
-if [ -n "$S" ] && ! tmux -L bashd has-session -t $S 2>/dev/null; then a=0; fi
-if [ "$c" = "-" ] && [ -f "$d/lock" ] && { [ "$a" = 0 ] || [ -z "$S" ]; }; then
-  echo 143 > "$d/code"; c=143; a=0
+sess_name=$(cat "$d/session" 2>/dev/null)
+if [ -n "$sess_name" ] && ! tmux -L bashd has-session -t "$sess_name" 2>/dev/null; then a=0; fi
+if [ "$c" = "-" ] && [ -f "$d/lock" ]; then
+  if [ "$a" = 0 ] || [ -z "$sess_name" ]; then
+    echo 143 > "$d/code"; c=143; a=0
+  elif command -v flock >/dev/null 2>&1; then
+    ref="/tmp/.bashd_ref.$$"
+    touch -d "@$(( $(date +%s) - __GRACE__ ))" "$ref" 2>/dev/null || ref=""
+    if [ -n "$ref" ] && [ "$d/lock" -ot "$ref" ] && [ ! "$d/out" -nt "$ref" ] \
+       && [ ! "$d/err" -nt "$ref" ] && flock -n "$d/lock" true 2>/dev/null; then
+      busy=0
+      for jl in "$HOME"/.bashd/jobs/*/lock; do
+        [ -f "$jl" ] || continue
+        jd=$(dirname "$jl")
+        [ "$(cat "$jd/session" 2>/dev/null)" = "$sess_name" ] || continue
+        [ -f "$jd/code" ] && continue
+        flock -n "$jl" true 2>/dev/null || { busy=1; break; }
+      done
+      if [ "$busy" = 0 ]; then echo 143 > "$d/code"; c=143; fi
+    fi
+    [ -n "$ref" ] && rm -f "$ref"
+  fi
 fi
 ob=$(tail -c +$((__CO__ + 1)) "$d/out" 2>/dev/null | head -c __MAX__ | base64 | tr -d "\n")
 eb=$(tail -c +$((__CE__ + 1)) "$d/err" 2>/dev/null | head -c __MAX__ | base64 | tr -d "\n")
@@ -423,11 +448,19 @@ eb=$(tail -c +$((__CE__ + 1)) "$d/err" 2>/dev/null | head -c __MAX__ | base64 | 
 # Creation of (or no-op check for) a persistent session on the target. The
 # init line applies session-lifetime settings (ulimit, BASHD_SESSION var).
 # Stale jobs of a freshly re-created session are marked 143 (terminated).
+# Race-safe: only the creator that won new-session runs init/pipe-pane/stamp.
 SESS_ENSURE = r'''
 if command -v tmux >/dev/null 2>&1; then :; else echo "BASHD_RESULT no-tmux"; exit 0; fi
+created=0
 if ! tmux -L bashd has-session -t __SESS__ 2>/dev/null; then
+  if tmux -L bashd new-session -d -s __SESS__ -x 220 -y 50 2>/dev/null; then
+    created=1
+  elif ! tmux -L bashd has-session -t __SESS__ 2>/dev/null; then
+    echo "BASHD_RESULT tmux-fail"; exit 0
+  fi
+fi
+if [ "$created" = 1 ]; then
   mkdir -p "$HOME/.bashd/tmux"
-  tmux -L bashd new-session -d -s __SESS__ -x 220 -y 50 || { echo "BASHD_RESULT tmux-fail"; exit 0; }
   tmux -L bashd set-option -t __SESS__ history-limit 50000 >/dev/null 2>&1
   tmux -L bashd pipe-pane -o -t __SESS__ "cat >> $HOME/.bashd/tmux/__SESS__.log"
   tmux -L bashd send-keys -t __SESS__ -l -- __INIT__
@@ -442,24 +475,62 @@ if ! tmux -L bashd has-session -t __SESS__ 2>/dev/null; then
 fi
 '''
 
-# Ctrl-C pending junk at the prompt, but never while one of OUR jobs is
-# running in this session (it would kill it); queued lines are safe anyway.
+# Ctrl-C pending junk at the prompt, but never while one of OUR jobs may
+# still run in this session. v0.3.1: "may run" = its lock is held (executing)
+# or younger than ORPHAN_GRACE_S (submit may still be typing it / it may sit
+# queued behind a running job). Stuck pre-0.3.1 records (codeless, unheld,
+# old) no longer block clearing forever.
 SESS_BUSYCLEAR = r'''
 busy=0
+haveflock=0; command -v flock >/dev/null 2>&1 && haveflock=1
+ref="/tmp/.bashd_bc_ref.$$"
+[ "$haveflock" = 1 ] && { touch -d "@$(( $(date +%s) - __GRACE__ ))" "$ref" 2>/dev/null || ref=""; }
 for j in "$HOME"/.bashd/jobs/*/session; do
   [ -f "$j" ] || continue
-  if [ "$(cat "$j")" = "__SESS__" ] && [ ! -f "$(dirname "$j")/code" ]; then busy=1; fi
+  jd=$(dirname "$j")
+  [ "$(cat "$j")" = "__SESS__" ] || continue
+  [ -f "$jd/code" ] && continue
+  if [ "$haveflock" = 0 ] || [ ! -f "$jd/lock" ]; then busy=1; break; fi
+  [ -n "$ref" ] && [ "$jd/lock" -nt "$ref" ] && { busy=1; break; }
+  flock -n "$jd/lock" true 2>/dev/null || { busy=1; break; }
 done
 if [ "$busy" = 0 ]; then tmux -L bashd send-keys -t __SESS__ C-c; fi
+[ -n "$ref" ] && rm -f "$ref"
+'''
+
+# v0.3.1: submits to one session serialize on a target-side lock — two clients
+# typing into the same pty at once interleave and corrupt each other's lines.
+# The guard wraps SESS_ENSURE too: a session creator sleeps 0.3s inside the
+# ensure (init typing); without the guard another client submits into the
+# fresh session during that window and the creator's stale-stamp loop then
+# finalizes that in-flight job as 143. Under the guard, creation and the
+# stamp are atomic w.r.t. every submitter. The job's lock file is created
+# after acquiring the guard, so a submit that died waiting leaves nothing
+# behind and a same-id retry heals cleanly.
+SUBMIT_GUARD = r'''
+HAVEFLOCK=0
+if command -v flock >/dev/null 2>&1; then
+  HAVEFLOCK=1
+  exec 9>"$HOME/.bashd/.submit-__SESS__.lock"
+  if ! flock -w 50 9; then echo "BASHD_RESULT submit-busy"; exit 0; fi
+fi
 '''
 
 JOB_SUBMIT_TAIL = r'''
 d="$HOME/.bashd/jobs/__ID__"
 if [ -f "$d/code" ]; then echo "BASHD_RESULT done-exists"; exit 0; fi
 mkdir -p "$d" || { echo "BASHD_RESULT error"; exit 0; }
-echo "__SESS__" > "$d/session"
 if ( set -C; : > "$d/lock" ) 2>/dev/null; then
-__SENDOPS__
+  echo "__SESS__" > "$d/session"
+  : > "$d/out"; : > "$d/err"
+__PAYLOAD__
+  if [ "$HAVEFLOCK" = 1 ]; then
+    tmux -L bashd send-keys -t __SESS__ -l -- __LINE_ATOMIC__
+    tmux -L bashd send-keys -t __SESS__ Enter
+  else
+    tmux -L bashd send-keys -t __SESS__ -l -- __LINE_PLAIN__
+    tmux -L bashd send-keys -t __SESS__ Enter
+  fi
   echo "BASHD_RESULT started"
 else
   echo "BASHD_RESULT exists"
@@ -519,6 +590,10 @@ SESSIONS_TMPL = r'''
 umask 077
 echo "BASHD_JOBS"
 tmux -L bashd list-sessions -F '#S' 2>/dev/null | sort > /tmp/.bashd_sess.$$ || : > /tmp/.bashd_sess.$$
+haveflock=0; command -v flock >/dev/null 2>&1 && haveflock=1
+ref="/tmp/.bashd_ref.$$"
+[ "$haveflock" = 1 ] && { touch -d "@$(( $(date +%s) - __GRACE__ ))" "$ref" 2>/dev/null || ref=""; }
+now=$(date +%s)
 for d in "$HOME"/.bashd/jobs/*/; do
   [ -d "$d" ] || continue
   c="-"; [ -f "$d/code" ] && c=$(cat "$d/code")
@@ -526,14 +601,30 @@ for d in "$HOME"/.bashd/jobs/*/; do
   if [ "$c" = "-" ] && [ -f "$d/lock" ]; then
     if [ "$s" = "-" ] || ! grep -qx "$s" /tmp/.bashd_sess.$$; then
       echo 143 > "$d/code"; c=143
+    elif [ "$haveflock" = 1 ] && [ -n "$ref" ] && [ "$d/lock" -ot "$ref" ] \
+      && [ ! "$d/out" -nt "$ref" ] && [ ! "$d/err" -nt "$ref" ] \
+      && flock -n "$d/lock" true 2>/dev/null; then
+      # v0.3.1 orphan rule — same as in JOB_READ_TMPL
+      busy=0
+      for jl in "$HOME"/.bashd/jobs/*/lock; do
+        [ -f "$jl" ] || continue
+        jd=$(dirname "$jl")
+        [ "$(cat "$jd/session" 2>/dev/null)" = "$s" ] || continue
+        [ -f "$jd/code" ] && continue
+        flock -n "$jl" true 2>/dev/null || { busy=1; break; }
+      done
+      if [ "$busy" = 0 ]; then echo 143 > "$d/code"; c=143; fi
     fi
   fi
   o=0; e=0
   [ -f "$d/out" ] && o=$(wc -c < "$d/out" | tr -d " ")
   [ -f "$d/err" ] && e=$(wc -c < "$d/err" | tr -d " ")
-  printf '%s\t%s\t%s\t%s\t%s\n' "$(basename "$d")" "$c" "$o" "$e" "$s"
+  age="-"
+  [ -f "$d/lock" ] && age=$((now - $(stat -c %Y "$d/lock" 2>/dev/null || echo "$now")))
+  cmd=$(head -n 1 "$d/run" 2>/dev/null | cut -c1-100 | tr "\t\r" "  ")
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(basename "$d")" "$c" "$o" "$e" "$s" "$age" "$cmd"
 done
-rm -f /tmp/.bashd_sess.$$
+rm -f /tmp/.bashd_sess.$$ ; [ -n "$ref" ] && rm -f "$ref"
 echo "BASHD_TTYS"
 tmux -L bashd list-sessions -F '#S' 2>/dev/null || true
 echo "BASHD_TTYLOGS"
@@ -545,43 +636,48 @@ echo "BASHD_DONE"
 '''
 
 
-def _submit_ops(jid, cmd, cwd, env):
-    """Lines to type into the persistent session shell so cmd runs INSIDE it
-    (cd/export persist) with output captured to the job's files. $HOME expands
-    in the session shell; every usage of $D is pre-quoted here."""
+def _submit_payload(jid, cmd, cwd, env):
+    """sh-script section that materializes the job's files DIRECTLY on the
+    target (the submit script itself arrives over ssh/stdio — the tty is
+    never used for payload bytes). v0.3.1: payloads used to be typed into the
+    session as heredocs; queued tty input can be flushed/discarded (canonical
+    buffer overflow, SIGINT input flush), destroying jobs mid-submit. Now the
+    only typed bytes are ONE constant-size line (~230 chars)."""
     J = "$HOME/.bashd/jobs/" + jid
-    lines = ['D="%s"; : >"$D/out"; : >"$D/err"' % J]
+    pre = []
     if env:
-        lines.append("export " + " ".join("%s=%s" % (k, shq(v)) for k, v in sorted(env.items())))
+        pre.append("export " + " ".join("%s=%s" % (k, shq(v)) for k, v in sorted(env.items())))
     if cwd:
-        lines.append("cd %s || { echo 97 >\"$D/code\"; }" % shq(cwd))
-    delim = "BASHD_D_" + secrets.token_hex(4)
-    printable = all(ch.isprintable() or ch == "\t" for ch in cmd)
-    maxline = max((len(x) for x in cmd.split("\n")), default=0)
-    if cmd and len(cmd) <= 2000 and maxline <= 500 and printable:
-        lines.append("cat >\"$D/run\" <<'%s'" % delim)
-        lines.extend(cmd.split("\n"))
-        lines.append(delim)
-    else:  # arbitrary bytes / very long lines: base64 keeps tty lines short
-        lines.append("base64 -d >\"$D/run\" <<'%s'" % delim)
-        b = base64.b64encode(cmd.encode()).decode()
-        lines.extend(b[i:i + 76] for i in range(0, len(b), 76))
-        lines.append(delim)
-    # eval and code-capture are SEPARATE typed lines: if the command is
-    # Ctrl-C'd, bash aborts the rest of the current input line, so the capture
-    # must live on its own line to still record the (130) code afterwards.
-    lines.append('[ -f "$D/code" ] || eval "$(cat "$D/run")" >"$D/out" 2>"$D/err"')
-    lines.append('rc=$?; [ -f "$D/code" ] || echo "$rc" >"$D/code"')
-    return lines
+        pre.append("cd %s || { echo 97 >\"$D/code\"; }" % shq(cwd))
+    if not pre:
+        pre = [":"]
+    d1, d2 = "BASHD_P_" + secrets.token_hex(4), "BASHD_R_" + secrets.token_hex(4)
+    b64pre = base64.b64encode(("\n".join(pre) + "\n").encode()).decode()
+    b64run = base64.b64encode(cmd.encode()).decode()
+
+    def heredoc(d, b, name):
+        return "base64 -d >\"%s/%s\" <<'%s'\n%s\n%s" % (
+            J, name, d, "\n".join(b[i:i + 76] for i in range(0, len(b), 76)), d)
+    return heredoc(d1, b64pre, "pre") + "\n" + heredoc(d2, b64run, "run")
 
 
-def _send_keys_lines(sess, lines):
-    out = []
-    for ln in lines:
-        if ln:
-            out.append('  tmux -L bashd send-keys -t %s -l -- %s' % (sess, shq(ln)))
-        out.append('  tmux -L bashd send-keys -t %s Enter' % sess)
-    return out
+def _submit_line(jid, executor="atomic"):
+    """The single line typed into the persistent session shell. The eval AND
+    its exit-code capture are one line (a separate capture line queued behind
+    the command can be discarded by the tty — the v0.2.x stuck-'running'
+    bug), and it sources $D/pre first so cd/exports run in the session shell
+    (they persist — the point of sessions). The atomic executor holds the
+    job's lock for the run (fd 8): reads, the fleet overview and prune use it
+    as the executing/orphan liveness marker; re-opening fd 8 in the next job
+    releases any lock a Ctrl-C'd job left held. If a Ctrl-C aborts the eval,
+    interactive bash skips the rest of the line and signal's 3s fallback
+    writes 130 — the v0.2 contract."""
+    D = '"$HOME/.bashd/jobs/%s"' % jid
+    body = '. "$D/pre" 2>/dev/null; eval "$(cat "$D/run")" >"$D/out" 2>"$D/err"; ' \
+           'rc=$?; [ -f "$D/code" ] || echo "$rc" >"$D/code"'
+    if executor == "atomic":
+        body = 'exec 8>>"$D/lock"; flock 8 2>/dev/null; %s; exec 8>&-' % body
+    return 'D=%s; [ -f "$D/code" ] || { %s; }' % (D, body)
 
 
 def _check_sess_name(s):
@@ -595,11 +691,18 @@ def job_start(host, jid, cmd, cwd=None, env=None, ulimit_mb=None, session="main"
     if ulimit_mb is None:
         ulimit_mb = host.defaults.get("ulimit_mb", DEFAULT_ULIMIT_MB)
     init = "ulimit -f %d 2>/dev/null; export BASHD_SESSION=%s" % (int(ulimit_mb) * 1024, shq(session))
-    script = ((SESS_ENSURE + SESS_BUSYCLEAR)
-              .replace("__SESS__", session).replace("__INIT__", shq(init)))
+    # order matters: the submit guard covers session creation (a creator that
+    # sleeps mid-ensure while another client submits into the fresh session
+    # would stamp that in-flight job as dead), the busy-clear decision, and
+    # the typing — all atomic w.r.t. every other submitter into this session
+    guard = (SUBMIT_GUARD.replace("__SESS__", session))
+    ensure = SESS_ENSURE.replace("__SESS__", session).replace("__INIT__", shq(init))
+    clear = SESS_BUSYCLEAR.replace("__SESS__", session).replace("__GRACE__", str(ORPHAN_GRACE_S))
+    script = guard + ensure + clear
     script += (JOB_SUBMIT_TAIL.replace("__SESS__", session).replace("__ID__", jid)
-               .replace("__SENDOPS__",
-                        "\n".join(_send_keys_lines(session, _submit_ops(jid, cmd, cwd, env)))))
+               .replace("__PAYLOAD__", _submit_payload(jid, cmd, cwd, env))
+               .replace("__LINE_ATOMIC__", shq(_submit_line(jid, "atomic")))
+               .replace("__LINE_PLAIN__", shq(_submit_line(jid, "plain"))))
     if dry_run:
         return {"dry_run": exec_argv_preview(host, script)}
     out = exec_script(host, script, timeout_s=60)[1]
@@ -610,6 +713,9 @@ def job_start(host, jid, cmd, cwd=None, env=None, ulimit_mb=None, session="main"
                          "run inside persistent tmux sessions)" % host.name)
     if state in ("error", "tmux-fail"):
         raise BashdError("job start failed on %s (session %s)" % (host.name, session))
+    if state == "submit-busy":
+        raise BashdError("submit lock busy on %s (session %s held >50s by another submit; "
+                         "retry)" % (host.name, session))
     return state
 
 
@@ -641,7 +747,8 @@ def job_read(host, jid, cursor_out=0, cursor_err=0, max_bytes=DEFAULT_MAX_BYTES,
     script = (JOB_READ_TMPL.replace("__ID__", jid)
               .replace("__CO__", str(int(cursor_out)))
               .replace("__CE__", str(int(cursor_err)))
-              .replace("__MAX__", str(int(max_bytes))))
+              .replace("__MAX__", str(int(max_bytes)))
+              .replace("__GRACE__", str(ORPHAN_GRACE_S)))
     if dry_run:
         return {"dry_run": exec_argv_preview(host, script)}
     out = exec_script(host, script, timeout_s=60)[1].strip()
@@ -988,9 +1095,25 @@ def do_signal(host, kind, key, sig="TERM", dry_run=False):
     return {"ok": True, "id": "%s:tty:%s" % (host.name, key), **tty_signal(host, key, mode, dry_run=dry_run)}
 
 
+def _compact_jobs(jobs):
+    """Fleet-overview shape (v0.3.1): running jobs in full, finished ones
+    summarized — a busy host with hundreds of finished records stays readable
+    (and cheap in agent context) while everything live stays visible."""
+    running = [j for j in jobs if j["running"]]
+    # newest (smallest age from submit time) last, so recent_finished[-5:] = the 5 most recent
+    finished = sorted((j for j in jobs if not j["running"]), key=lambda j: -(j.get("age_s") or 0))
+    recent = [{"id": j["id"], "exit_code": j["exit_code"], "age_s": j.get("age_s"),
+               "cmd": j.get("cmd")} for j in finished[-5:]]
+    return {"running": running,
+            "finished_count": len(finished),
+            "finished_out_bytes": sum(j["out_bytes"] for j in finished),
+            "recent_finished": recent}
+
+
 def _probe_host(name, host):
     try:
-        rc, out, err = exec_script(host, SESSIONS_TMPL, timeout_s=15)
+        script = SESSIONS_TMPL.replace("__GRACE__", str(ORPHAN_GRACE_S))
+        rc, out, err = exec_script(host, script, timeout_s=15)
         if rc != 0:
             return {"host": name, "reachable": True, "error": "remote script rc=%s %s" % (rc, err[-200:])}
         jobs, ttys = [], []
@@ -1007,10 +1130,11 @@ def _probe_host(name, host):
                 break
             elif section == "jobs":
                 p = line.split("\t")
-                if len(p) == 5:
+                if len(p) == 7:
                     jobs.append({"id": "%s:%s" % (name, p[0]), "running": p[1] == "-",
                                  "exit_code": _code_to_int(p[1]), "out_bytes": int(p[2]),
-                                 "err_bytes": int(p[3]), "session": p[4]})
+                                 "err_bytes": int(p[3]), "session": p[4],
+                                 "age_s": _code_to_int(p[5]), "cmd": p[6]})
             elif section == "tty_names":
                 if line.strip():
                     tmux_names.append(line.strip())
@@ -1020,7 +1144,7 @@ def _probe_host(name, host):
                     ttys.append({"name": p[0], "id": "%s:tty:%s" % (name, p[0]),
                                  "alive": p[0] in tmux_names, "log_bytes": int(p[1])})
         return {"host": name, "reachable": True, "path": "local" if host.local else "ssh",
-                "note": host.notes, "jobs": jobs, "ttys": ttys}
+                "note": host.notes, "ttys": ttys, **_compact_jobs(jobs)}
     except Unreachable as e:
         return {"host": name, "reachable": False, "error": str(e)}
     except BashdError as e:
@@ -1040,22 +1164,40 @@ def do_sessions(host_name=None, hosts=None):
 
 def do_prune(host, host_name, dry_run=False, stale_s=None):
     """Remove finished job dirs and tty logs whose tmux session is dead.
-    Before removal, a codeless job whose session is gone is finalized as 143
-    (it can never finish: target reboot or killed session). With stale_s, a
-    codeless job whose out/err have BOTH been quiet for stale_s seconds is
-    finalized too — the session-alive-but-wedged case; opt-in because a
-    legitimately silent long run could match."""
+    Before removal, a codeless job is finalized as 143 if its session is gone
+    (target reboot, killed session) or — v0.3.1 — if it is a true orphan: lock
+    free, all files older than ORPHAN_GRACE_S, and no job of its session holds
+    a lock (nothing is executing or queued-startable). With stale_s, a codeless
+    job whose out/err have BOTH been quiet for stale_s seconds is finalized
+    too — the wedged-executor case; opt-in because a legitimately silent long
+    run could match."""
     script = r'''
 umask 077
 n=0
 tmux -L bashd list-sessions -F '#S' 2>/dev/null | sort > /tmp/.bashd_alive.$$ || : > /tmp/.bashd_alive.$$
 __STALE_INIT__
+haveflock=0; command -v flock >/dev/null 2>&1 && haveflock=1
+oref=""
+[ "$haveflock" = 1 ] && { oref="/tmp/.bashd_oref.$$"; touch -d "@$(( $(date +%s) - __GRACE__ ))" "$oref" 2>/dev/null || oref=""; }
 for d in "$HOME"/.bashd/jobs/*/; do
   [ -d "$d" ] || continue
   if [ ! -f "$d/code" ] && [ -f "$d/lock" ]; then
     s=$(cat "$d/session" 2>/dev/null)
     dead=0
     if [ -z "$s" ] || ! grep -qx "$s" /tmp/.bashd_alive.$$; then dead=1; fi
+    if [ "$dead" = 0 ] && [ -n "$oref" ] && [ "$d/lock" -ot "$oref" ] \
+      && [ ! "$d/out" -nt "$oref" ] && [ ! "$d/err" -nt "$oref" ] \
+      && flock -n "$d/lock" true 2>/dev/null; then
+      busy=0
+      for jl in "$HOME"/.bashd/jobs/*/lock; do
+        [ -f "$jl" ] || continue
+        jd=$(dirname "$jl")
+        [ "$(cat "$jd/session" 2>/dev/null)" = "$s" ] || continue
+        [ -f "$jd/code" ] && continue
+        flock -n "$jl" true 2>/dev/null || { busy=1; break; }
+      done
+      [ "$busy" = 0 ] && dead=1
+    fi
 __STALE_CHECK__
     [ "$dead" = 1 ] && echo 143 > "$d/code"
   fi
@@ -1067,9 +1209,10 @@ for l in "$HOME"/.bashd/tmux/*.log; do
   b=$(basename "$l" .log)
   grep -qx "$b" /tmp/.bashd_alive.$$ || { rm -f "$l" && t=$((t+1)); }
 done
-rm -f /tmp/.bashd_alive.$$
+rm -f /tmp/.bashd_alive.$$ ; [ -n "$oref" ] && rm -f "$oref"
 echo "BASHD_PRUNED jobs=$n logs=$t"
 '''
+    script = script.replace("__GRACE__", str(ORPHAN_GRACE_S))
     if stale_s:
         script = script.replace(
             "__STALE_INIT__",
@@ -1209,15 +1352,20 @@ def mcp_tools():
              "sig": _s("string", "INT (default) | KILL | TERM | HUP — jobs always get Ctrl-C"),
          }, ["id"])},
         {"name": "bash_sessions", "description":
-            "Fleet overview: probes hosts in parallel (fail-fast per host), lists jobs "
-            "(running/exit code/sizes) and tty sessions (alive/log size) per host.",
+            "Fleet overview: probes hosts in parallel (fail-fast per host). Running "
+            "jobs are listed in full (id, cmd, age, sizes, session); finished jobs "
+            "are summarized (count + bytes + the 5 most recent with exit codes) so "
+            "a busy host stays readable. Also lists tty sessions (alive/log size). "
+            "Stale 'running' records are self-healed to 143 here (v0.3.1).",
          "inputSchema": _schema({"host": _s("string", "Restrict to one host alias")})},
         {"name": "bash_prune", "description":
-            "Remove finished batch-job records and tty logs of dead sessions from a host's "
-            "~/.bashd (live sessions are never touched). Codeless jobs whose session is "
-            "gone are finalized as exit 143 first. stale_s (optional): also reap codeless "
-            "jobs whose output has been quiet this many seconds while their session is "
-            "still alive — opt-in, a silent long run could match.",
+            "Remove finished batch-job records and tty logs of dead sessions from a "
+            "host's ~/.bashd (live sessions are never touched). Codeless jobs are "
+            "finalized as exit 143 first when their session is gone OR when they are "
+            "true orphans (lock free, quiet for 15 min, nothing executing in their "
+            "session — v0.3.1 self-heal). stale_s (optional): also reap codeless jobs "
+            "quiet this many seconds even while held — opt-in, a silent long run "
+            "could match.",
          "inputSchema": _schema({"host": _s("string", "Host alias"),
                                  "stale_s": _s("number", "Reap jobs quiet for this many seconds")},
                                 ["host"])},
@@ -1606,8 +1754,80 @@ def selftest():
         r = do_sessions("local")
         hst = r["hosts"][0]
         assert hst["reachable"], hst
-        assert any(j["id"].startswith("local:") for j in hst["jobs"]), hst
-    check("sessions listing", t_sessions)
+        assert "running" in hst and "finished_count" in hst, hst
+        assert hst["finished_count"] >= 1, hst  # earlier tests left finished jobs
+        assert all("cmd" in j and "age_s" in j for j in hst["running"]), hst
+        jid = stid()
+        job_start(H, jid, "echo listed", session="listsess")
+        do_wait(H, "job", jid, timeout_s=10)
+        r2 = do_sessions("local")["hosts"][0]
+        assert any(j["id"].endswith(":" + jid) and j["cmd"].startswith("echo listed")
+                   for j in r2["recent_finished"]), r2["recent_finished"]
+    check("sessions listing (compact: running full + finished summary)", t_sessions)
+
+    def t_atomic_concurrent():
+        # v0.3.1 regression test: several clients submitting into ONE session
+        # at once (mixed payload sizes) — every job must run exactly once and
+        # record its code; nothing may stay 'running' forever. NB: random ids —
+        # a fixed id would collide with a previous run's leftover record
+        # (done-exists) and fake a failure.
+        import subprocess as sp
+        sess = "st" + secrets.token_hex(3)
+        ids = ["stc" + secrets.token_hex(3) for _ in range(6)]
+        procs = []
+        for i, jid in enumerate(ids):
+            payload = "echo C%d-OK" % i if i % 2 else "echo C%d-%s" % (i, "y" * 2400)
+            procs.append(sp.Popen(["python3", os.path.abspath(__file__), "run",
+                                   "--session", sess, "--timeout", "60",
+                                   "--id", jid, "local", payload],
+                                  stdout=sp.DEVNULL, stderr=sp.DEVNULL))
+        rc = [p.wait(timeout=90) for p in procs]
+        assert all(c == 0 for c in rc), rc
+        for i, jid in enumerate(ids):
+            r = job_read(H, jid)
+            assert r["status"] == "done" and r["exit_code"] == 0, (i, r)
+            assert ("C%d-OK" % i) in r["stdout"] or ("C%d-y" % i) in r["stdout"], (i, r)
+    check("concurrent submits into one session all finalize", t_atomic_concurrent)
+
+    def t_orphan_heal():
+        # v0.3.1: a codeless, lock-free, quiet job whose session is ALIVE is a
+        # dead orphan (its submit lines were lost) — read finalizes it as 143;
+        # but while ANY job of that session holds its lock (executing/queued),
+        # siblings must NOT be finalized.
+        sess = "st" + secrets.token_hex(3)
+        session_ensure(H, sess)
+        base = os.path.join(os.path.expanduser("~/.bashd"), "jobs")  # real substrate
+
+        def fake(jid, age_s):
+            d = os.path.join(base, jid)
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, "session"), "w").write(sess)
+            for f in ("lock", "out", "err"):
+                open(os.path.join(d, f), "w").close()
+            old = time.time() - max(age_s, 1)
+            for f in ("lock", "out", "err"):
+                os.utime(os.path.join(d, f), (old, old))
+            return d
+
+        orphan = fake("storphan1", ORPHAN_GRACE_S + 60)
+        r = job_read(H, "storphan1")
+        assert r["status"] == "done" and r["exit_code"] == 143, r
+
+        # held sibling protects a queued-looking codeless job from finalization
+        held = os.path.join(base, "stheld1")
+        os.makedirs(held, exist_ok=True)
+        open(os.path.join(held, "session"), "w").write(sess)
+        open(os.path.join(held, "lock"), "w").close()
+        holder = subprocess.Popen(["flock", os.path.join(held, "lock"),
+                                   "-c", "sleep 4"])
+        time.sleep(0.3)
+        queued = fake("stqueued1", ORPHAN_GRACE_S + 60)
+        r2 = job_read(H, "stqueued1")
+        assert r2["status"] == "running", r2  # session busy -> not an orphan
+        holder.wait()
+        r3 = job_read(H, "stqueued1")
+        assert r3["status"] == "done" and r3["exit_code"] == 143, r3
+    check("orphan finalize: heals stale, spares queued-behind-held", t_orphan_heal)
 
     def t_mcp():
         import itertools
@@ -1798,7 +2018,7 @@ def selftest():
 tmux -L bashd list-sessions -F '#S' 2>/dev/null | grep '^st' | while read -r s; do
   tmux -L bashd kill-session -t "$s" 2>/dev/null
 done
-rm -rf "$HOME"/.bashd/jobs/st* "$HOME"/.bashd/tmux/st*.log 2>/dev/null
+rm -rf "$HOME"/.bashd/jobs/st* "$HOME"/.bashd/tmux/st*.log "$HOME"/.bashd/.submit-st*.lock 2>/dev/null
 echo CLEANED''', 15)
     check("selftest cleanup", t_cleanup)
 

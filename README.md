@@ -5,9 +5,17 @@ One file. Python stdlib only. Two faces: an **MCP stdio server** and a **CLI** o
 **v0.2 — one substrate: persistent tmux sessions.** Every command runs *inside* a named
 tmux session on the target host (default `main`). What that buys: **the environment is
 persistent by design** — `cd`, `export`, venv activation survive across calls and across
-connections. Output is still captured to per-stream files with real exit codes (the
-submission wraps your command: `eval <cmd> > out 2> err`, then `echo $? > code`), so
-cursor reads, regex waits and idempotent retries work exactly as before.
+connections. Output is still captured to per-stream files with real exit codes, so cursor
+reads, regex waits and idempotent retries work exactly as before.
+
+**v0.3.1 — submits are one typed line.** The eval *and* its exit-code capture are a single
+constant-size line typed into the session, and the command payload (plus `--cwd`/`--env`)
+is written to the job's files by the submit script itself over ssh — the session tty only
+ever carries ~230 bytes per job. Concurrent submits to one session serialize on a
+target-side lock (which also covers session creation), and a job holds its lock for its
+whole execution — reads, the fleet overview and prune use that to tell *executing*,
+*queued* and *dead orphan* jobs apart, so a submit whose lines were lost finalizes as 143
+instead of lingering as "running" forever.
 
 Built for agents working across a fleet over **bad, unstable networks**: all state and all
 execution live on the *target* host, never in the tool process and never anchored to a
@@ -106,12 +114,14 @@ bashd start web --mode tty --name ops          # bare interactive session
 bashd write web:tty:ops 'sudo journalctl -u nginx -n 50'
 bashd read web:tty:ops --screen                # live pane
 bashd sessions                                 # fleet overview, parallel, fail-fast
+                                               #   (running jobs in full incl cmd+age;
+                                               #    finished summarized: count+bytes+5 recent)
 bashd prune web                                # remove finished job records + dead tty logs
 bashd prune web --stale 3600                   # also reap codeless jobs quiet 1h (wedged, session alive)
 bashd paths web                                # route table: costs, sticky path, probe backoff
 bashd paths web --repath                       # probe cheaper paths now, re-latch the first that works
 bashd hosts                                    # show registry
-bashd selftest                                 # 20 end-to-end checks
+bashd selftest                                 # 22 end-to-end checks
 ```
 
 **Persistent-environment semantics (v0.2):** `--cwd` and `--env` are applied in the session
@@ -139,31 +149,52 @@ JSON-RPC (line-delimited), no SDK dependency.
 
 ## Requirements & limits
 
-- Targets need a POSIX shell, tmux (all modes now), and `base64`/`wc`/`tail` (any Linux).
+- Targets need a POSIX shell, tmux (all modes), `flock` (util-linux — everywhere on
+  Linux) and `base64`/`wc`/`tail`.
 - Key-based ssh auth (BatchMode); password prompts are never attempted.
 - Session-lifetime output cap (`ulimit -f`, default 512 MB, applied at session creation) so
   runaway commands can't fill the target's disk while unwatched.
-- One command at a time per session (extras queue in the shell — order preserved).
+- One command at a time per session (extras queue in the shell — order preserved). Submits
+  to one session serialize on a target-side lock, so several clients may safely submit
+  concurrently; each job then holds its own lock while executing.
 - Sessions survive any disconnect but not a target reboot (tmux dies; job records persist
   and are finalized as 143 — on read, on `sessions`, and at prune — so nothing lingers as
-  "running" forever). `prune --stale SECONDS` additionally reaps codeless records whose
-  output has been quiet that long while their session is still alive (wedged session;
-  opt-in — a legitimately silent long run could match).
+  "running" forever). v0.3.1 adds the **orphan rule**: even with the session alive, a
+  codeless job whose lock nobody holds, whose files have been quiet ≥ 15 min, and whose
+  session has no executing job is finalized as 143 — that is the fate of a submit whose
+  typed line was lost, which previously stuck as "running" forever. `prune --stale
+  SECONDS` additionally reaps codeless records whose output has been quiet that long even
+  while held (wedged executor; opt-in — a legitimately silent long run could match).
+- Ctrl-C (`bashd signal`, any sig — jobs always get Ctrl-C) aborts the job's line; the
+  code file lands via signal's 3-second fallback as 130. A job that *ignores* SIGINT keeps
+  running with a 130 record — stop it with signal KILL on its tty session or kill the
+  session.
 - `HOME` on targets must be slash-free (standard on Linux) — pipe-pane log paths rely on it.
 
 ## Status
 
-v0.3.0 — selftest 20/20. Adds **cost-aware routing with auto re-latch** (per-path `cost`,
+v0.3.1 — selftest 22/22; concurrency-stress verified (10×6 concurrent submits, zero
+lost/stuck jobs). Root-caused and fixed the "stuck running forever" class found in field
+use (16 records on one host): a job's exit-code capture used to be a *separate typed
+line* queued behind the command, and queued tty input can be discarded (input-buffer
+overflow under concurrent submits, SIGINT input flush, readline edges) — the finished
+command then never recorded a code. Submits now type exactly one constant-size line
+(payload and cd/env travel in the submit script over ssh, never through the tty),
+serialize per session on a target-side `flock` that also covers session creation (the
+creator's 0.3 s init sleep used to race concurrent submitters into its stale-stamp),
+and hold the job lock during execution as the liveness marker for the new orphan rule
+(read/sessions/prune self-heal lost submits as 143 after a 15-minute grace). The fleet
+overview gained cmd previews and ages and now shows running jobs in full with finished
+jobs summarized. v0.3.0 added **cost-aware routing with auto re-latch** (per-path `cost`,
 sticky path, detached background probe that promotes a recovered cheap route without
 blocking any call, `bashd paths [--repath]` / `bash_hosts {repath:true}` for state and
 manual probing) and **mid-command failover** (`run` retries its idempotent submit across
 short outages; errors carry a per-path attempt trail; `run`/`wait` report
 `link_drops`/`link_recovered` around route switches). v0.2.1: dead-session job records
-finalize as 143 everywhere (the "stuck running forever" wart), `prune --stale` for
-session-alive wedged records, and a ControlMaster on the inner leg of nested-hop paths
-(warm hop calls drop from ~2× handshake cost to one). v0.2.0 was fleet-tested 2026-09-24
-on remote hosts over real ssh: **cross-connection env/cwd persistence verified
-end-to-end**, and the multi-path fallback proven in the field — one fleet host was
-reachable that day only through its second-choice relay path, and the sticky-path logic
-latched onto it transparently (`bashd sessions <host>` re-probes every configured path in
-one call once the network heals). Design rationale and tool survey: `docs/RESEARCH.md`.
+finalize as 143 everywhere, `prune --stale`, ControlMaster on the inner leg of nested-hop
+paths. v0.2.0 was fleet-tested 2026-09-24 on remote hosts over real ssh:
+**cross-connection env/cwd persistence verified end-to-end**, and the multi-path fallback
+proven in the field — one fleet host was reachable that day only through its
+second-choice relay path, and the sticky-path logic latched onto it transparently
+(`bashd sessions <host>` re-probes every configured path in one call once the network
+heals). Design rationale and tool survey: `docs/RESEARCH.md`.
