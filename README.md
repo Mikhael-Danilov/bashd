@@ -17,6 +17,15 @@ whole execution — reads, the fleet overview and prune use that to tell *execut
 *queued* and *dead orphan* jobs apart, so a submit whose lines were lost finalizes as 143
 instead of lingering as "running" forever.
 
+**v0.4 — a human terminal and a wire transport.** `bashd term HOST` attaches your
+terminal to any persistent session: turn-based by nature (a local line editor, so only
+Enter and Ctrl-C ever cross the network) yet an ordinary terminal over a good link (raw
+byte passthrough, output *pushed* by the target, resize followed, vim-class apps work).
+It rides a custom transport built for extremely slow and unstable networks: one
+long-lived ssh channel running a tiny frame agent instead of one ssh exec per operation —
+gzip-tagged payloads, 10 Hz output push, and reconnect-and-resume by byte cursor when
+the link dies mid-stream. Details below.
+
 Built for agents working across a fleet over **bad, unstable networks**: all state and all
 execution live on the *target* host, never in the tool process and never anchored to a
 connection. Losing the link at any instant — mid-command, mid-wait, even mid-start — loses
@@ -49,6 +58,11 @@ no work and no output; every call reconnects and resumes by byte cursor.
   (backoff 30 s → 15 min) and re-latches it on recovery — no calls are blocked by probing.
 - **Host registry with notes.** `~/.bashd/hosts.json` maps aliases to connection details and
   per-host notes that ride along in every response (fleet gotchas become first-class metadata).
+- **A human terminal and a wire transport (v0.4).** `bashd term` attaches you to any session —
+  raw passthrough with pushed output on good links (an ordinary terminal), a local line editor
+  on terrible ones (only Enter/Ctrl-C cross the network). The wire transport behind it is one
+  long-lived ssh channel per attach with gzip-tagged frames, 10 Hz push, and
+  reconnect-and-resume by cursor — see "v0.4" below.
 
 ## Install
 
@@ -120,8 +134,10 @@ bashd prune web                                # remove finished job records + d
 bashd prune web --stale 3600                   # also reap codeless jobs quiet 1h (wedged, session alive)
 bashd paths web                                # route table: costs, sticky path, probe backoff
 bashd paths web --repath                       # probe cheaper paths now, re-latch the first that works
+bashd term web                                 # HUMAN terminal on session 'main' (v0.4)
+bashd term web --session ops --mode turn       # line-editor input (bad links); ~l switches back
 bashd hosts                                    # show registry
-bashd selftest                                 # 22 end-to-end checks
+bashd selftest                                 # 26 end-to-end checks
 ```
 
 **Persistent-environment semantics (v0.2):** `--cwd` and `--env` are applied in the session
@@ -146,6 +162,59 @@ your event push; in-MCP, use the `bash_wait` tool with a modest timeout.
 Tools: `bash_run`, `bash_start`, `bash_read`, `bash_wait`, `bash_write`, `bash_signal`,
 `bash_sessions`, `bash_prune`, `bash_hosts` — same semantics as the CLI. Hand-rolled stdio
 JSON-RPC (line-delimited), no SDK dependency.
+
+## v0.4 — `bashd term`: a human terminal + the wire transport
+
+```bash
+bashd term HOST [--session main] [--mode auto|live|turn] [--no-wire] [--scrollback 4096]
+```
+
+Attaches your terminal to a persistent session — the same substrate the agents use, so
+you can join `main` and see the environment every `bashd run` built, or attach to any
+other session. It is a **turn-based terminal that behaves like an ordinary one over a
+good connection**:
+
+- **live mode** — raw byte passthrough both ways over the wire transport: the target's
+  *pushed* output deltas make echo latency ≈ one network RTT; every keystroke, arrow key,
+  Ctrl-C and full-screen app (vim, htop) works exactly as over ssh. Resizing your
+  terminal resizes the remote pane. Auto-selected when the measured RTT is healthy
+  (< 0.7 s on wire, < 0.25 s on per-call ssh, always for `local`).
+- **turn mode** — a local line editor (history, Ctrl-A/E/U/K/W, arrows, Home/End): only
+  **Enter** and **Ctrl-C** ever cross the network, one small frame each — built for very
+  slow or unstable links, where per-keystroke round trips and remote echo are torture.
+  Output still streams as it is produced. Auto-selected when RTT is high, or after two
+  link drops within two minutes (auto-degrade, never auto-upgrade).
+- tilde escapes: `~.` detach (the session lives on), `~l`/`~t` switch input mode, `~i`
+  link stats, `~~` a literal tilde. In turn mode type them as a line + Enter; in live
+  mode they are the first keys after a fresh line, ssh-style.
+- attach shows the last `--scrollback` bytes of history; if the session was killed by a
+  bare `exit`, the next line you submit recreates it (fresh env).
+- `--no-wire` forces the classic one-ssh-exec-per-operation transport — same UX, higher
+  latency, zero long-lived channels (restrictive relays, fire-and-forget environments).
+
+**The wire transport** (what `term` rides whenever it can establish one) is a custom
+protocol for extremely slow and unstable networks: ONE long-lived ssh channel running a
+tiny target-side agent, instead of one `ssh … sh -s` exec per operation. Frames are
+single text lines; payloads are base64, gzip-tagged when that is smaller, and the ssh
+channel itself is compressed (`-C`). The agent **pushes** output deltas at 10 Hz (a
+POSIX-sh flavor without push covers targets that lack bash). If the channel dies, it is
+re-spawned over the next configured path (sticky-first, like every bashd call), output
+resumes from the last delivered cursor — nothing is lost or duplicated, because sessions
+and logs live in target-side tmux the whole time. Input that was queued locally while
+the link was down flushes on reconnect; input that was *sent but not acked* when the
+link died is reported and dropped — never replayed, because a replayed Enter could
+execute a line twice. Field-tested over a real flaky link: a forced mid-stream channel
+death on a ~200 ms two-hop relay path reconnects in under a second with byte-exact
+stream continuity.
+
+Two humans (or a human and the tilde escapes) attaching the same session see the same
+stream; note that a human typing into a session *while an agent submits a job into it*
+interleaves on the pty like two typists — use a separate `--session` for interactive
+work if that matters.
+
+Fix in passing: `write`/`bash_write` with `append_newline=false` no longer presses
+Enter (the Enter send used to land in the script unconditionally — visible as commands
+executing when they should only have been typed).
 
 ## Requirements & limits
 
@@ -173,7 +242,11 @@ JSON-RPC (line-delimited), no SDK dependency.
 
 ## Status
 
-v0.3.1 — selftest 22/22; concurrency-stress verified (10×6 concurrent submits, zero
+v0.4.0 — selftest 26/26; the wire transport and `term` verified end-to-end locally, over
+a nested-hop path, and over a real ~200 ms two-hop relay link (push latency, forced
+mid-stream channel death → 0.9 s reconnect with byte-exact resume, Ctrl-C delivery,
+resize following, auto live/turn selection). `write --no-newline` fixed (it used to
+press Enter anyway). v0.3.1 — concurrency-stress verified (10×6 concurrent submits, zero
 lost/stuck jobs). Root-caused and fixed the "stuck running forever" class found in field
 use (16 records on one host): a job's exit-code capture used to be a *separate typed
 line* queued behind the command, and queued tty input can be discarded (input-buffer

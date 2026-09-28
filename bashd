@@ -17,6 +17,14 @@ Design: https://github.com/.../bashd + docs/RESEARCH.md (summary below).
   A mid-execution transport death moves the whole control script to the next
   path (safe: scripts exec_script runs are idempotent by substrate design —
   user commands live target-side in tmux + files, never inside the ssh call).
+- v0.4 `term` + wire: a HUMAN terminal on any persistent session — turn-based
+  by nature (a local line editor, so only Enter/Ctrl-C cross the network) that
+  behaves like an ordinary terminal over a good link (raw byte passthrough,
+  output pushed at 10 Hz, resize forwarded). Rides a custom transport for
+  extremely slow/unstable networks: one long-lived ssh channel running a tiny
+  target-side frame agent (gzip-tagged payloads, reconnect-and-resume by byte
+  cursor) instead of one ssh exec per operation. --no-wire falls back to the
+  classic per-call transport with the same UX.
 
 Substrate layout on a target host:
   ~/.bashd/jobs/<id>/run out err code lock session (batch jobs; the lock is
@@ -26,20 +34,34 @@ Substrate layout on a target host:
 
 import argparse
 import base64
+import codecs
+import collections
+import gzip
+import itertools
 import json
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal as _signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.3.1"
+try:  # term (v0.4) is POSIX-only; everything else keeps working without these
+    import fcntl
+    import struct
+    import termios
+    import tty
+except ImportError:
+    fcntl = struct = termios = tty = None
+
+VERSION = "0.4.0"
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ENVKEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_MAX_BYTES = 16384      # per-stream bytes returned per read
@@ -323,6 +345,18 @@ def _ssh_argv_for_path(host, path):
     return _ssh_opts(host) + path["args"] + [host.ssh]
 
 
+def _path_order(host):
+    """Path attempt order: sticky first, then cheapest-first. exec_script and
+    the wire transport (v0.4) both iterate this."""
+    si = sticky_path_idx(host)
+    order = []
+    if si is not None and 0 <= si < len(host.paths):
+        order.append(si)
+    order += sorted((i for i in range(len(host.paths)) if i not in order),
+                    key=lambda i: (host.paths[i].get("cost", i), i))
+    return order
+
+
 def exec_script(host, script, timeout_s):
     """Run a POSIX sh script on the target. Returns (rc, stdout, stderr).
     Paths are tried sticky-first then cheapest-first; a mid-execution transport
@@ -339,13 +373,7 @@ def exec_script(host, script, timeout_s):
             raise BashdError("local exec timed out after %ss" % timeout_s)
         return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
 
-    si = sticky_path_idx(host)
-    order = []
-    if si is not None and 0 <= si < len(host.paths):
-        order.append(si)
-    order += sorted((i for i in range(len(host.paths)) if i not in order),
-                    key=lambda i: (host.paths[i].get("cost", i), i))
-
+    order = _path_order(host)
     last_err, last_unreach, attempts = None, None, []
     for idx in order:
         argv = _ssh_argv_for_path(host, host.paths[idx]) + ["sh", "-s"]
@@ -573,7 +601,7 @@ printf '{"size":%s,"alive":%s,"out":"%s","screen":"%s"}\n' "$s" "$a" "$b" "$sc"
 TTY_WRITE_TMPL = r'''
 umask 077
 tmux -L bashd send-keys -t __NAME__ -l -- __DATA__ || { echo "BASHD_RESULT error"; exit 0; }
-__ENTER__tmux -L bashd send-keys -t __NAME__ Enter
+__ENTER__
 echo "BASHD_RESULT ok"
 '''
 
@@ -817,16 +845,23 @@ def tty_read(host, name, cursor=0, max_bytes=DEFAULT_MAX_BYTES, screen=False, dr
         raise BashdError("tty read: bad envelope from %s: %r" % (host.name, out[-200:]))
     ob = _b64d(env.get("out", ""))
     chunk = ob.decode("utf-8", "replace")
+    # stdout_b: the raw bytes (term streams terminal control sequences that
+    # must not be round-tripped through a lossy text decode)
     return {"alive": bool(env.get("alive")),
-            "stdout": chunk, "cursor": cursor + len(ob),
+            "stdout": chunk, "stdout_b": ob, "cursor": cursor + len(ob),
             "size": int(env.get("size", 0)),
             "screen": _b64d(env.get("screen", "")).decode("utf-8", "replace")}
 
 
 def tty_write(host, name, data, append_newline=True, dry_run=False):
-    script = (TTY_WRITE_TMPL.replace("__NAME__", name)
-              .replace("__DATA__", shq(data))
-              .replace("__ENTER__", "" if append_newline is False else ""))
+    # append_newline=False must send EXACTLY the bytes (term's live mode types
+    # raw keystrokes; a forced Enter would execute half-typed lines). v0.3.x
+    # had the Enter send unconditionally — a latent bash_write bug.
+    enter = ("tmux -L bashd send-keys -t __NAME__ Enter >/dev/null 2>&1"
+             if append_newline is not False else ":")
+    script = (TTY_WRITE_TMPL.replace("__ENTER__", enter)   # enter carries __NAME__
+              .replace("__NAME__", name)
+              .replace("__DATA__", shq(data)))
     if dry_run:
         return {"dry_run": exec_argv_preview(host, script)}
     out = exec_script(host, script, timeout_s=30)[1]
@@ -841,6 +876,576 @@ def tty_signal(host, name, mode, dry_run=False):
     out = exec_script(host, script, timeout_s=30)[1]
     m = re.search(r"BASHD_RESULT (\S+)", out)
     return {"action": m.group(1) if m else "unknown"}
+
+
+# ---------------------------------------------------------------- wire transport (v0.4)
+
+# A custom transport for extremely slow / unstable links: ONE long-lived ssh
+# channel per attach, running a tiny frame agent on the target, instead of one
+# `ssh … sh -s` exec per operation (no per-op handshakes, gzip payloads,
+# server-pushed output deltas so echo latency ~= one RTT). Frames are single
+# text lines:
+#   C->A: PING | W <seq> <sess> <payload> | R <rid> <sess> <cursor> <max>
+#         | S <sess> int|kill | Z <sess> <cols> <rows> | SUB <sess> <cursor>
+#         | UNSUB <sess> | Q
+#   A->C: HELO <ver> <flavor> <push> | PONG <ms> | ACK <seq>
+#         | DATA <rid> <sess> <newcursor> <payload>   (rid 0 = push)
+#         | ST <rid> <sess> <size> <alive> | GONE <sess> | OK/ERR <what>
+# <payload> = "g"+b64(gzip(bytes)) or "b"+b64(bytes), whichever is smaller.
+# The bash flavor pushes at WIRE_TICK; a POSIX-sh flavor (no `read -t`, no
+# bash) answers PING/W/R/S/Z only — the client polls it. On channel death the
+# client re-spawns over the next path and resumes from delivered cursors;
+# sent-but-unacked input is REPORTED and dropped, never replayed (a replayed
+# Enter could execute a line twice).
+
+WIRE_PUSH_MAX = 12288        # raw bytes per push/read frame
+WIRE_SPLIT = 3000            # raw bytes per W frame (client splits big writes)
+WIRE_GZ_MIN = 300            # gzip payloads from this size (23 B container overhead)
+WIRE_TICK = 0.1              # agent push loop period (bash flavor)
+WIRE_PING_EVERY = 5.0
+WIRE_QUEUE_MAX = 65536       # typed-ahead input buffered locally while link is down
+
+WIRE_AGENT_BASH = r'''umask 077
+[ -n "$BASH_VERSION" ] || exit 9   # dash would busy-spin on `read -t`; fall to the sh agent
+set -f
+T="${TMPDIR:-/tmp}/.bashd_wire_$$"
+trap 'rm -f "$T" 2>/dev/null; exit 0' INT TERM EXIT
+CURS=""; SUBS=""
+cur_of() { for kc in $CURS; do case "$kc" in "$1":*) echo "${kc#*:}"; return;; esac; done; echo 0; }
+set_cur() { o=""; for kc in $CURS; do case "$kc" in "$1":*) continue;; esac; o="$o $kc"; done; CURS="$o $1:$2"; }
+log_of() { echo "$HOME/.bashd/tmux/$1.log"; }
+alive() { tmux -L bashd has-session -t "$1" 2>/dev/null; }
+FB_N=0
+frame_out() {  # $1 log, $2 start cursor, $3 max -> "<N> <payload>" on stdout
+  : > "$T" 2>/dev/null
+  tail -c +$(( $2 + 1 )) "$1" 2>/dev/null | head -c "$3" > "$T" 2>/dev/null
+  FB_N=$(wc -c < "$T" | tr -d " \n"); [ -n "$FB_N" ] || FB_N=0
+  if [ "$FB_N" -ge 300 ]; then printf '%s g' "$FB_N"; gzip -c "$T" 2>/dev/null | base64 | tr -d "\n"
+  else printf '%s b' "$FB_N"; base64 < "$T" 2>/dev/null | tr -d "\n"; fi
+}
+push_all() {
+  [ -n "$SUBS" ] || return 0
+  for s in $SUBS; do
+    alive "$s" || { echo "GONE $s"; SUBS=$(printf "%s\n" $SUBS | grep -vx "$s" | tr "\n" " "); continue; }
+    lg=$(log_of "$s"); [ -f "$lg" ] || continue
+    sz=$(wc -c < "$lg" 2>/dev/null | tr -d " \n"); [ -n "$sz" ] || sz=0
+    c=$(cur_of "$s")
+    if [ "$sz" -gt "$c" ]; then
+      fr=$(frame_out "$lg" "$c" __PUSH_MAX__); FB_N=${fr%% *}; p=${fr#* }
+      set_cur "$s" "$(( c + FB_N ))"
+      echo "DATA 0 $s $(( c + FB_N )) $p"
+    fi
+  done
+}
+do_cmd() {
+  case "$1" in
+    PING) echo "PONG $(date +%s%3N 2>/dev/null || date +%s)" ;;
+    W)
+      case "$4" in
+        g*) d=$(printf "%s" "${4#g}" | base64 -d 2>/dev/null | gzip -dc 2>/dev/null; printf x) ;;
+        *) d=$(printf "%s" "${4#b}" | base64 -d 2>/dev/null; printf x) ;;
+      esac
+      d=${d%x}
+      if alive "$3"; then
+        tmux -L bashd send-keys -t "$3" -l -- "$d" 2>/dev/null && echo "ACK $2" || echo "ERR W"
+      else
+        echo "GONE $3"
+      fi ;;
+    R)
+      if ! alive "$3"; then echo "GONE $3"; echo "ST $2 $3 0 0"; return; fi
+      lg=$(log_of "$3"); [ -f "$lg" ] || lg=/dev/null
+      fr=$(frame_out "$lg" "$4" "$5"); FB_N=${fr%% *}; p=${fr#* }
+      set_cur "$3" "$(( $4 + FB_N ))"
+      sz=$(wc -c < "$lg" 2>/dev/null | tr -d " \n"); [ -n "$sz" ] || sz=0
+      echo "DATA $2 $3 $(( $4 + FB_N )) $p"
+      echo "ST $2 $3 $sz 1" ;;
+    S)
+      if ! alive "$2"; then echo "GONE $2"; return; fi
+      if [ "$3" = kill ]; then tmux -L bashd kill-session -t "$2" 2>/dev/null && echo "OK S killed" || echo "ERR S"
+      else tmux -L bashd send-keys -t "$2" C-c 2>/dev/null && echo "OK S int" || echo "ERR S"; fi ;;
+    Z)
+      tmux -L bashd set-option -w -t "$2" window-size manual >/dev/null 2>&1
+      tmux -L bashd resize-window -t "$2" -x "$3" -y "$4" >/dev/null 2>&1 && echo "OK Z" || echo "ERR Z" ;;
+    SUB)
+      case " $SUBS " in *" $2 "*) : ;; *) SUBS="$SUBS $2" ;; esac
+      set_cur "$2" "${3:-0}"; echo "OK SUB $2" ;;
+    UNSUB)
+      SUBS=$(printf "%s\n" $SUBS | grep -vx "$2" | tr "\n" " "); echo "OK UNSUB $2" ;;
+    Q) echo "BYE"; exit 0 ;;
+    *) echo "ERR frame $1" ;;
+  esac
+}
+echo "HELO 1 bash push"
+pend=""
+while :; do
+  if IFS= read -r -t __TICK__ seg; then
+    line="$pend$seg"; pend=""
+    set -- $line
+    [ -n "$1" ] && do_cmd "$@"
+  else
+    pend="$pend$seg"      # partial line: TCP may split long frames
+    [ "${#pend}" -gt 131072 ] && pend=""
+  fi
+  push_all
+done
+'''
+
+WIRE_AGENT_SH = r'''umask 077
+set -f
+T="${TMPDIR:-/tmp}/.bashd_wire_$$"
+trap 'rm -f "$T" 2>/dev/null; exit 0' INT TERM EXIT
+log_of() { echo "$HOME/.bashd/tmux/$1.log"; }
+alive() { tmux -L bashd has-session -t "$1" 2>/dev/null; }
+FB_N=0
+frame_out() {
+  : > "$T" 2>/dev/null
+  tail -c +$(( $2 + 1 )) "$1" 2>/dev/null | head -c "$3" > "$T" 2>/dev/null
+  FB_N=$(wc -c < "$T" | tr -d " \n"); [ -n "$FB_N" ] || FB_N=0
+  if [ "$FB_N" -ge 300 ]; then printf '%s g' "$FB_N"; gzip -c "$T" 2>/dev/null | base64 | tr -d "\n"
+  else printf '%s b' "$FB_N"; base64 < "$T" 2>/dev/null | tr -d "\n"; fi
+}
+do_cmd() {
+  case "$1" in
+    PING) echo "PONG $(date +%s%3N 2>/dev/null || date +%s)" ;;
+    W)
+      case "$4" in
+        g*) d=$(printf "%s" "${4#g}" | base64 -d 2>/dev/null | gzip -dc 2>/dev/null; printf x) ;;
+        *) d=$(printf "%s" "${4#b}" | base64 -d 2>/dev/null; printf x) ;;
+      esac
+      d=${d%x}
+      if alive "$3"; then
+        tmux -L bashd send-keys -t "$3" -l -- "$d" 2>/dev/null && echo "ACK $2" || echo "ERR W"
+      else
+        echo "GONE $3"
+      fi ;;
+    R)
+      if ! alive "$3"; then echo "GONE $3"; echo "ST $2 $3 0 0"; return; fi
+      lg=$(log_of "$3"); [ -f "$lg" ] || lg=/dev/null
+      fr=$(frame_out "$lg" "$4" "$5"); FB_N=${fr%% *}; p=${fr#* }
+      sz=$(wc -c < "$lg" 2>/dev/null | tr -d " \n"); [ -n "$sz" ] || sz=0
+      echo "DATA $2 $3 $(( $4 + FB_N )) $p"
+      echo "ST $2 $3 $sz 1" ;;
+    S)
+      if ! alive "$2"; then echo "GONE $2"; return; fi
+      if [ "$3" = kill ]; then tmux -L bashd kill-session -t "$2" 2>/dev/null && echo "OK S killed" || echo "ERR S"
+      else tmux -L bashd send-keys -t "$2" C-c 2>/dev/null && echo "OK S int" || echo "ERR S"; fi ;;
+    Z)
+      tmux -L bashd set-option -w -t "$2" window-size manual >/dev/null 2>&1
+      tmux -L bashd resize-window -t "$2" -x "$3" -y "$4" >/dev/null 2>&1 && echo "OK Z" || echo "ERR Z" ;;
+    Q) echo "BYE"; exit 0 ;;
+    *) echo "ERR frame $1" ;;
+  esac
+}
+echo "HELO 1 sh poll"
+while IFS= read -r line; do
+  set -- $line
+  [ -n "$1" ] && do_cmd "$@"
+done
+'''
+
+
+def wire_enc(raw):
+    if len(raw) >= WIRE_GZ_MIN:
+        try:
+            gz = "g" + base64.b64encode(gzip.compress(raw)).decode("ascii")
+            if len(gz) < len(raw) * 4 // 3 + 2:
+                return gz
+        except Exception:
+            pass
+    return "b" + base64.b64encode(raw).decode("ascii")
+
+
+def wire_dec(pl):
+    try:
+        if pl[:1] == "g":
+            return gzip.decompress(base64.b64decode(pl[1:]))
+        return base64.b64decode(pl[1:])
+    except Exception:
+        return b""
+
+
+def _wire_argv(host, path, interpreter):
+    if host.local:
+        return [interpreter, "-s"]
+    # -C: zlib the whole channel — frame payloads are base64 text, our own
+    # gzip handles the big deltas and ssh -C squeezes the rest
+    argv = _ssh_argv_for_path(host, path)
+    return argv[:1] + ["-C"] + argv[1:] + [interpreter, "-s"]
+
+
+class WireChannel:
+    """One long-lived frame channel to a target. Thread-safe; reconnects are
+    internal (monitor thread re-spawns over _path_order, resubscribes every
+    session at its last delivered cursor, then flushes typed-ahead input that
+    was queued while down). Sent-but-unacked input frames are dropped with an
+    input-dropped event — never replayed."""
+
+    def __init__(self, host, on_event=None):
+        self.host = host
+        self.on_event = on_event or (lambda kind, info: None)
+        self.proc = None
+        self.flavor = None
+        self.push = False
+        self.ver = 0
+        self.wlock = threading.Lock()
+        self.rlock = threading.Lock()
+        self._rid = itertools.count(1)
+        self._seq = 0
+        self._rpend = {}          # rid -> {"ev": Event, "frames": [(kind, ...)]}
+        self._unacked = {}        # seq -> bytes sent, not yet ACKed
+        self.subs = {}            # sess -> callback(bytes | None)
+        self.cursors = {}         # sess -> last delivered cursor
+        self.rtt = None
+        self.dead = True
+        self.closed = False
+        self.drops = 0
+        self._inq = collections.deque()
+        self._inq_bytes = 0
+        self._cond = threading.Condition()
+        self._pong_evt = threading.Event()
+        self._pong_t0 = 0.0
+
+    def _flavors(self):
+        if self.host.local:
+            out = []
+            b = shutil.which("bash")
+            if b:
+                out.append((b, WIRE_AGENT_BASH))
+            out.append((shutil.which("sh") or "/bin/sh", WIRE_AGENT_SH))
+            return out
+        return [("bash", WIRE_AGENT_BASH), ("sh", WIRE_AGENT_SH)]
+
+    def _spawn(self, idx, interpreter, script):
+        argv = _wire_argv(self.host, self.host.paths[idx], interpreter)
+        try:
+            p = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            raise BashdError("wire spawn failed: %s" % e)
+        try:
+            p.stdin.write(script.replace("__PUSH_MAX__", str(WIRE_PUSH_MAX))
+                          .replace("__TICK__", str(WIRE_TICK)).encode())
+            p.stdin.flush()
+        except OSError:
+            pass  # agent died instantly (rc 9/127) — poll() below notices
+        deadline = time.time() + self.host.connect["timeout_s"] * 2 + 5
+        line = b""
+        while time.time() < deadline:
+            if p.poll() is not None:
+                try:
+                    p.stdin.close()
+                except OSError:
+                    pass
+                raise BashdError("wire agent exited rc=%s" % p.returncode)
+            r, _, _ = select.select([p.stdout], [], [], 0.2)
+            if r:
+                line = p.stdout.readline()
+                if line:
+                    break
+        if not line:
+            p.kill()
+            raise BashdError("wire HELO timeout")
+        parts = line.decode("utf-8", "replace").split()
+        if len(parts) < 4 or parts[0] != "HELO":
+            p.kill()
+            raise BashdError("wire bad HELO: %r" % line[:100])
+        self.proc = p
+        self.ver = int(parts[1])
+        self.flavor = parts[2]
+        self.push = parts[3] == "push"
+        return {"ver": self.ver, "flavor": self.flavor, "push": self.push, "path": idx}
+
+    def connect(self):
+        attempts = []
+        for idx in _path_order(self.host):
+            for interpreter, script in self._flavors():
+                try:
+                    info = self._spawn(idx, interpreter, script)
+                except BashdError as e:
+                    attempts.append("path%d/%s:%s" % (idx, interpreter, e))
+                    continue
+                if not self.host.local:
+                    note_sticky_path(self.host, idx)
+                self.dead = False
+                self._start_reader()
+                threading.Thread(target=self._monitor, daemon=True,
+                                 name="bashd-wire-monitor").start()
+                threading.Thread(target=self._pinger, daemon=True,
+                                 name="bashd-wire-pinger").start()
+                return info
+        trail = "; ".join(attempts[:6])
+        raise Unreachable("%s wire: no path connected (%s)" % (self.host.name, trail))
+
+    def _start_reader(self):
+        threading.Thread(target=self._reader, daemon=True,
+                         name="bashd-wire-reader").start()
+    # ---- plumbing -------------------------------------------------------
+
+    def _send(self, line):  # caller holds wlock
+        if self.dead or self.closed or not self.proc:
+            raise BashdError("wire channel down")
+        try:
+            self.proc.stdin.write((line + "\n").encode())
+            self.proc.stdin.flush()
+        except OSError as e:
+            self._die("send failed: %s" % e)
+            raise BashdError("wire send failed")
+
+    def _reader(self):
+        me = self.proc
+        for raw in iter(me.stdout.readline, b""):
+            if self.proc is not me or self.closed:
+                break
+            self._dispatch(raw.decode("utf-8", "replace").rstrip("\n"))
+        if self.proc is me and not self.closed:
+            self._die("agent closed the channel")
+
+    def _dispatch(self, line):
+        t = line.split(" ")
+        op = t[0]
+        if op == "DATA":
+            rid, sess, cur = int(t[1]), t[2], int(t[3])
+            data = wire_dec(t[4]) if len(t) > 4 else b""
+            if rid:
+                with self.rlock:
+                    if rid in self._rpend:
+                        self._rpend[rid]["frames"].append(("data", cur, data))
+            elif sess in self.subs:
+                self.cursors[sess] = cur
+                try:
+                    self.subs[sess](data)
+                except Exception:
+                    pass
+        elif op == "ST":
+            rid = int(t[1])
+            with self.rlock:
+                pend = self._rpend.get(rid)
+                if pend:
+                    pend["frames"].append(("st", int(t[3]), int(t[4])))
+                    pend["ev"].set()
+        elif op == "ACK":
+            self._unacked.pop(int(t[1]), None)
+        elif op == "PONG":
+            r = time.time() - self._pong_t0
+            self.rtt = r if self.rtt is None else self.rtt * 0.7 + r * 0.3
+            self._pong_evt.set()
+        elif op == "GONE":
+            sess = t[1] if len(t) > 1 else ""
+            if sess in self.subs:
+                try:
+                    self.subs[sess](None)
+                except Exception:
+                    pass
+        elif op == "ERR":
+            self.on_event("agent-msg", line)
+        elif op == "BYE":
+            return  # reader EOF path cleans up
+
+    def _die(self, reason):
+        with self._cond:
+            if self.dead or self.closed:
+                return
+            self.dead = True
+            self.drops += 1
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            in_flight = sum(self._unacked.values())
+            self._unacked.clear()
+            with self.rlock:
+                for v in self._rpend.values():
+                    v["ev"].set()
+            self._pong_evt.set()
+            self._cond.notify_all()
+        if in_flight:
+            self.on_event("input-dropped", in_flight)
+        self.on_event("dead", reason)
+
+    def _monitor(self):
+        backoff = 1.0
+        while not self.closed:
+            with self._cond:
+                while not self.dead and not self.closed:
+                    self._cond.wait(1.0)
+                if self.closed:
+                    return
+            ok = False
+            for idx in _path_order(self.host):
+                for interpreter, script in self._flavors():
+                    try:
+                        self._spawn(idx, interpreter, script)
+                    except BashdError:
+                        continue
+                    if not self.host.local:
+                        note_sticky_path(self.host, idx)
+                    self.dead = False
+                    self._start_reader()
+                    with self.wlock:
+                        try:
+                            for s in list(self.subs):
+                                self._send("SUB %s %d" % (s, self.cursors.get(s, 0)))
+                        except BashdError:
+                            self.dead = True  # died again mid-resub; keep retrying
+                            continue
+                    self._flush_input()
+                    self.on_event("reconnected", {"path": idx, "flavor": self.flavor})
+                    ok = True
+                    break
+                if ok:
+                    break
+            if not ok:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 10.0)
+            else:
+                backoff = 1.0
+
+    def _pinger(self):
+        misses = 0
+        while not self.closed:
+            time.sleep(WIRE_PING_EVERY)
+            if self.closed or self.dead:
+                continue
+            if self.ping() is None:
+                misses += 1
+                if misses >= 2:
+                    self._die("ping timeout (link blackholed?)")
+                    return
+            else:
+                misses = 0
+
+    # ---- public ops -----------------------------------------------------
+
+    def read(self, sess, cursor, max_bytes=WIRE_PUSH_MAX):
+        rid = next(self._rid)
+        ev = threading.Event()
+        with self.rlock:
+            self._rpend[rid] = {"ev": ev, "frames": []}
+        try:
+            with self.wlock:
+                self._send("R %d %s %d %d" % (rid, sess, cursor, max_bytes))
+            if not ev.wait(max(30.0, (self.rtt or 0) * 8)):
+                raise BashdError("wire read timeout")
+        finally:
+            with self.rlock:
+                pend = self._rpend.pop(rid, {"frames": []})
+        data = b""
+        cur, size, alive = cursor, 0, 1
+        for kind, a, b in pend["frames"]:
+            if kind == "data":
+                cur, data = a, b
+            else:
+                size, alive = a, b
+        return {"cursor": cur, "data": data, "size": size, "alive": bool(alive)}
+
+    def _queue_input(self, sess, data):
+        if self._inq_bytes + len(data) > WIRE_QUEUE_MAX:
+            self.on_event("input-dropped", len(data))
+            return
+        self._inq.append((sess, data))
+        self._inq_bytes += len(data)
+
+    def _flush_input(self):  # monitor thread, after reconnect
+        with self.wlock:
+            while self._inq:
+                sess, data = self._inq.popleft()
+                self._inq_bytes -= len(data)
+                for i in range(0, len(data), WIRE_SPLIT):
+                    chunk = data[i:i + WIRE_SPLIT]
+                    self._seq += 1
+                    self._unacked[self._seq] = len(chunk)
+                    try:
+                        self._send("W %d %s %s" % (self._seq, sess, wire_enc(chunk)))
+                    except BashdError:
+                        self._unacked.pop(self._seq, None)
+                        self._inq.appendleft((sess, data[i:]))
+                        self._inq_bytes += len(data) - i
+                        return
+
+    def write(self, sess, data):
+        data = data.replace(b"\x00", b"")  # argv cannot carry NUL
+        if not data:
+            return {"sent": 0}
+        if self.dead:
+            self._queue_input(sess, data)
+            return {"queued": self._inq_bytes}
+        with self.wlock:
+            for i in range(0, len(data), WIRE_SPLIT):
+                chunk = data[i:i + WIRE_SPLIT]
+                self._seq += 1
+                self._unacked[self._seq] = len(chunk)
+                try:
+                    self._send("W %d %s %s" % (self._seq, sess, wire_enc(chunk)))
+                except BashdError:
+                    self._unacked.pop(self._seq, None)
+                    self._queue_input(sess, data[i:])
+                    return {"queued": self._inq_bytes}
+            return {"sent": len(data), "seq": self._seq}
+
+    def sub(self, sess, cursor, cb):
+        self.subs[sess] = cb
+        self.cursors[sess] = cursor
+        if not self.dead:
+            with self.wlock:
+                try:
+                    self._send("SUB %s %d" % (sess, cursor))
+                except BashdError:
+                    pass
+
+    def unsub(self, sess):
+        self.subs.pop(sess, None)
+        if not self.dead:
+            with self.wlock:
+                try:
+                    self._send("UNSUB %s" % sess)
+                except BashdError:
+                    pass
+
+    def signal(self, sess, mode="int"):
+        if not self.dead:
+            with self.wlock:
+                try:
+                    self._send("S %s %s" % (sess, mode))
+                except BashdError:
+                    pass
+
+    def resize(self, sess, cols, rows):
+        if not self.dead:
+            with self.wlock:
+                try:
+                    self._send("Z %s %d %d" % (sess, cols, rows))
+                except BashdError:
+                    pass
+
+    def ping(self, timeout=None):
+        self._pong_evt.clear()
+        self._pong_t0 = time.time()
+        try:
+            with self.wlock:
+                self._send("PING")
+        except BashdError:
+            return None
+        if not self._pong_evt.wait(timeout or max(8.0, (self.rtt or 0) * 6)):
+            return None
+        return time.time() - self._pong_t0
+
+    def close(self):
+        self.closed = True
+        with self._cond:
+            self._cond.notify_all()
+        if self.proc:
+            try:
+                self.proc.stdin.write(b"Q\n")
+                self.proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------- high-level ops
@@ -1265,6 +1870,784 @@ def do_paths(host_name=None, repath=False):
     return res
 
 
+# ---------------------------------------------------------------- human terminal (v0.4)
+
+TERM_ATTACH_BYTES = 4096     # history tail shown at attach
+
+_TERM_HELP = ("~. detach | ~l live input | ~t turn (line) input | ~i info | ~~ literal tilde "
+              "(turn: as a line + Enter; live: first keys after a fresh line, ssh-style)")
+
+
+def _term_decide_mode(want, samples, kind, local):
+    """auto: live (raw passthrough) when the link is healthy; turn (local line
+    editor, only Enter/Ctrl-C cross the network) when it is not."""
+    if want in ("live", "turn"):
+        return want
+    ss = sorted(x for x in samples if x is not None)
+    if not ss:
+        return "turn"
+    med = ss[len(ss) // 2]
+    if kind == "wire":
+        return "live" if med < 0.7 else "turn"
+    return "live" if local or med < 0.25 else "turn"
+
+
+class _LineEditor:
+    """Turn-mode input: local line editing (history, ctrl-a/e/u/w/k, arrows) so
+    a bad link never taxes editing. Draws on the terminal's last line; the app
+    hides it before writing remote output and re-shows it after."""
+
+    _ESCS = (b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D", b"\x1b[H", b"\x1b[F",
+             b"\x1b[1~", b"\x1b[4~", b"\x1b[3~", b"\x1b[5~", b"\x1b[6~",
+             b"\x1bOA", b"\x1bOB", b"\x1bOC", b"\x1bOD", b"\x1bOH", b"\x1bOF",
+             b"\x1b[200~", b"\x1b[201~")
+
+    def __init__(self, term):
+        self.term = term
+        self.buf = ""
+        self.pos = 0
+        self.hist = []
+        self.hi = 0
+        self.draft = ""
+        self.visible = False
+        self.pend = b""
+        self.run = b""
+        self.dec = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def show(self):
+        self.visible = True
+        self.render()
+
+    def hide(self):
+        if self.visible:
+            os.write(1, b"\r\x1b[K")
+        self.visible = False
+
+    def render(self):
+        if not self.visible:
+            return
+        out = b"\r\x1b[K" + self.buf.encode("utf-8", "replace")
+        if 0 < self.pos < len(self.buf):
+            out += b"\r\x1b[%dC" % (self.pos + 1)
+        os.write(1, out)
+
+    def clear(self):
+        self.buf = ""
+        self.pos = 0
+        self.render()
+
+    def insert(self, text):
+        self.buf = self.buf[:self.pos] + text + self.buf[self.pos:]
+        self.pos += len(text)
+        self.render()
+
+    # ---- key handling ----
+
+    def feed(self, data):
+        if self.pend:
+            data = self.pend + data
+            self.pend = b""
+        i, n = 0, len(data)
+        while i < n:
+            b = data[i]
+            if b == 0x1B:
+                seq = self._esc(data, i)
+                if seq is None:  # incomplete escape sequence — wait for more
+                    self.pend = data[i:]
+                    if len(self.pend) > 16:
+                        self.pend = b""
+                    self._flush_run()
+                    return
+                self._flush_run()
+                self._esc_action(seq)
+                i += len(seq)
+                continue
+            if b < 0x20 or b == 0x7F:
+                self._flush_run()
+                self._ctl(b)
+                i += 1
+                continue
+            self.run += data[i:i + 1]
+            i += 1
+        self._flush_run()
+
+    def _flush_run(self):
+        if self.run:
+            text = self.dec.decode(self.run)
+            self.run = b""
+            if text:
+                self.insert(text)
+
+    def _esc(self, data, i):
+        rest = data[i:]
+        for s in self._ESCS:
+            if rest.startswith(s):
+                return s
+        if any(s.startswith(rest) for s in self._ESCS):
+            return None
+        return b"\x1b"  # unknown sequence — swallow the ESC byte
+
+    def _esc_action(self, seq):
+        t = seq[1:]
+        if t in (b"[A", b"OA"):
+            self._hist_prev()
+        elif t in (b"[B", b"OB"):
+            self._hist_next()
+        elif t in (b"[C", b"OC"):
+            self.pos = min(len(self.buf), self.pos + 1)
+            self.render()
+        elif t in (b"[D", b"OD"):
+            self.pos = max(0, self.pos - 1)
+            self.render()
+        elif t in (b"[H", b"[1~", b"OH"):
+            self.pos = 0
+            self.render()
+        elif t in (b"[F", b"[4~", b"OF"):
+            self.pos = len(self.buf)
+            self.render()
+        elif t == b"[3~":
+            if self.pos < len(self.buf):
+                self.buf = self.buf[:self.pos] + self.buf[self.pos + 1:]
+                self.render()
+        # pageup/pagedown/paste markers: ignored
+
+    def _ctl(self, b):
+        if b in (0x0D, 0x0A):
+            self._enter()
+        elif b in (0x7F, 0x08):
+            if self.pos > 0:
+                self.buf = self.buf[:self.pos - 1] + self.buf[self.pos:]
+                self.pos -= 1
+                self.render()
+        elif b == 0x03:
+            self.term.ctrl_c()
+        elif b == 0x04:
+            self.term.ctrl_d()
+        elif b == 0x01:
+            self.pos = 0
+            self.render()
+        elif b == 0x05:
+            self.pos = len(self.buf)
+            self.render()
+        elif b == 0x02:
+            self.pos = max(0, self.pos - 1)
+            self.render()
+        elif b == 0x06:
+            self.pos = min(len(self.buf), self.pos + 1)
+            self.render()
+        elif b == 0x15:
+            self.buf = self.buf[self.pos:]
+            self.pos = 0
+            self.render()
+        elif b == 0x0B:
+            self.buf = self.buf[:self.pos]
+            self.render()
+        elif b == 0x17:
+            i = self.pos
+            while i > 0 and self.buf[i - 1] == " ":
+                i -= 1
+            while i > 0 and self.buf[i - 1] != " ":
+                i -= 1
+            self.buf = self.buf[:i] + self.buf[self.pos:]
+            self.pos = i
+            self.render()
+        elif b == 0x0C:
+            os.write(1, b"\x1b[H\x1b[2J")
+            self.render()
+        elif b == 0x09:
+            self.insert("\t")
+
+    def _enter(self):
+        line = self.buf
+        self.hide()
+        self.buf = ""
+        self.pos = 0
+        self.hi = len(self.hist)
+        if line and (not self.hist or self.hist[-1] != line):
+            self.hist.append(line)
+        self.term.submit_line(line)
+
+    def _hist_prev(self):
+        if not self.hist:
+            return
+        if self.hi == len(self.hist):
+            self.draft = self.buf
+        self.hi = max(0, self.hi - 1)
+        self.buf = self.hist[self.hi]
+        self.pos = len(self.buf)
+        self.render()
+
+    def _hist_next(self):
+        if self.hi >= len(self.hist):
+            return
+        self.hi += 1
+        self.buf = self.hist[self.hi] if self.hi < len(self.hist) else self.draft
+        self.pos = len(self.buf)
+        self.render()
+
+
+class _ExecBackend:
+    """Per-call ssh transport (the classic one): same UX as the wire backend,
+    higher latency — every poll and every input flush is an exec_script call."""
+    kind = "exec"
+
+    def __init__(self, host, sess, emit):
+        self.host, self.sess, self.emit = host, sess, emit
+        self.cursor = 0
+        self.alive = True
+        self.rtt = None
+        self._q = collections.deque()
+        self._qw = 0
+        self._qcond = threading.Condition()
+        self._stop = False
+
+    def attach(self, cursor):
+        self.cursor = cursor
+        self.alive = True
+        self._stop = False
+        threading.Thread(target=self._poll_loop, daemon=True,
+                         name="bashd-term-poll").start()
+        threading.Thread(target=self._flush_loop, daemon=True,
+                         name="bashd-term-flush").start()
+
+    def detach(self):
+        self._stop = True
+        with self._qcond:
+            self._qcond.notify_all()
+
+    def reattach(self, cursor):
+        self.cursor = cursor
+        self.alive = True
+
+    def _poll_loop(self):
+        idle = 0
+        was_err = False
+        while not self._stop:
+            t0 = time.time()
+            try:
+                r = tty_read(self.host, self.sess, self.cursor, 16384)
+                d = time.time() - t0
+                self.rtt = d if self.rtt is None else self.rtt * 0.7 + d * 0.3
+                if was_err:
+                    was_err = False
+                    self.emit("net", ("recovered", None))
+                if r["stdout_b"]:
+                    self.cursor = r["cursor"]
+                    self.emit("out", r["stdout_b"])
+                    idle = 0
+                else:
+                    idle += 1
+                if not r["alive"]:
+                    if self.alive:
+                        self.alive = False
+                        self.emit("gone", None)
+                    while not self._stop and not self.alive:
+                        time.sleep(0.4)
+                    continue
+            except (Unreachable, BashdError) as e:
+                was_err = True
+                self.emit("net", ("dead", str(e)))
+                time.sleep(2.0)
+                continue
+            base = 0.12 if self.host.local else max(0.15, min(1.0, (self.rtt or 0.2) * 1.25))
+            time.sleep(base if idle < 3 else min(2.0, base * 3))
+
+    def write(self, data):
+        data = data.replace(b"\x00", b"")
+        if not data:
+            return
+        with self._qcond:
+            if self._qw + len(data) > 262144:
+                self.emit("net", ("input-dropped", len(data)))
+                return
+            self._q.append(data)
+            self._qw += len(data)
+            self._qcond.notify_all()
+
+    def _flush_loop(self):
+        while not self._stop:
+            with self._qcond:
+                while not self._stop and not self._q:
+                    self._qcond.wait(0.5)
+                if self._stop:
+                    return
+                merged = b"".join(self._q)
+                self._q.clear()
+                self._qw = 0
+            time.sleep(0.015)  # small merge window for burst typing
+            with self._qcond:
+                if self._q:
+                    merged += b"".join(self._q)
+                    self._q.clear()
+                    self._qw = 0
+            try:
+                tty_write(self.host, self.sess, merged.decode("utf-8", "replace"),
+                          append_newline=False)
+            except (Unreachable, BashdError) as e:
+                self.emit("net", ("dead", str(e)))
+
+    def signal_int(self):
+        try:
+            tty_signal(self.host, self.sess, "ctrl-c")
+        except (Unreachable, BashdError) as e:
+            self.emit("net", ("dead", str(e)))
+
+    def resize(self, cols, rows):
+        script = ("tmux -L bashd set-option -w -t %s window-size manual >/dev/null 2>&1; "
+                  "tmux -L bashd resize-window -t %s -x %d -y %d >/dev/null 2>&1; "
+                  "echo BASHD_RESULT ok" % (self.sess, self.sess, cols, rows))
+        try:
+            exec_script(self.host, script, timeout_s=15)
+        except BashdError:
+            pass
+
+    def latency_samples(self):
+        out = []
+        for _ in range(2):
+            t0 = time.time()
+            try:
+                tty_read(self.host, self.sess, self.cursor, 1)
+                out.append(time.time() - t0)
+            except BashdError:
+                pass
+        return out
+
+
+class _WireBackend:
+    """The v0.4 wire transport backend. push flavor: output arrives as agent
+    pushes (echo latency ~= RTT). poll flavor: an R-poll loop at ~link rate."""
+    kind = "wire"
+
+    def __init__(self, chan, sess, emit, push):
+        self.chan, self.sess, self.emit, self.push = chan, sess, emit, push
+        self.cursor = 0
+        self._stop = False
+        if not push:
+            threading.Thread(target=self._poll_loop, daemon=True,
+                             name="bashd-term-wirepoll").start()
+
+    def attach(self, cursor):
+        self.cursor = cursor
+        self.chan.sub(self.sess, cursor, self._on_data)
+
+    def detach(self):
+        self._stop = True
+        self.chan.unsub(self.sess)
+
+    def reattach(self, cursor):
+        self.cursor = cursor
+        self.chan.sub(self.sess, cursor, self._on_data)
+
+    def _on_data(self, data):
+        if data is None:
+            self.emit("gone", None)
+            return
+        self.cursor += len(data)
+        self.emit("out", data)
+
+    def _poll_loop(self):
+        while not self._stop:
+            try:
+                r = self.chan.read(self.sess, self.cursor, WIRE_PUSH_MAX)
+            except BashdError:
+                time.sleep(1.0)
+                continue
+            if r["data"]:
+                self._on_data(r["data"])
+            if not r["alive"]:
+                self._on_data(None)
+                time.sleep(1.0)
+                continue
+            time.sleep(max(0.1, min(0.8, (self.chan.rtt or 0.2))))
+
+    def write(self, data):
+        self.chan.write(self.sess, data)
+
+    def signal_int(self):
+        self.chan.signal(self.sess, "int")
+
+    def resize(self, cols, rows):
+        self.chan.resize(self.sess, cols, rows)
+
+    def latency_samples(self):
+        out = [self.chan.ping() for _ in range(3)]
+        return [x for x in out if x is not None] or [9.9]
+
+
+class _TermApp:
+    """The human terminal. One main loop: select() on stdin (user input) and a
+    self-pipe (remote output, net events, SIGWINCH); only the main thread ever
+    touches the screen, so the editor never races the output stream."""
+
+    def __init__(self, host, sess, want_mode, use_wire, scrollback):
+        self.host, self.sess = host, sess
+        self.want_mode = want_mode
+        self.use_wire = use_wire
+        self.scrollback = scrollback
+        self.mode = None
+        self.running = True
+        self.gone = False
+        self.drop_times = []
+        self.bytes_out = 0
+        self.t0 = time.time()
+        self.editor = _LineEditor(self)
+        self.backend = None
+        self.chan = None
+        self._q = collections.deque()
+        self._qr, self._qwfd = os.pipe()
+        for fd in (self._qr, self._qwfd):
+            fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+        self._saved_term = None
+        self._old_winch = self._old_term = None
+        self._cols = self._rows = None
+        self._resize_at = 0.0
+        self._live_at_bol = True
+        self._hold_tilde = False
+        self._last_out_nl = True
+
+    def emit(self, kind, data):  # any thread
+        self._q.append((kind, data))
+        try:
+            os.write(self._qwfd, b"x")
+        except OSError:
+            pass
+
+    # ---- lifecycle ----
+
+    def run(self):
+        self._raw_on()
+        try:
+            self._attach()
+            while self.running:
+                timeout = self._select_timeout()
+                try:
+                    r, _, _ = select.select([0, self._qr], [], [], timeout)
+                except InterruptedError:
+                    continue
+                if 0 in r:
+                    bs = os.read(0, 8192)
+                    if not bs:
+                        break
+                    self._feed(bs)
+                if self._qr in r:
+                    try:
+                        while os.read(self._qr, 256):
+                            pass
+                    except OSError:
+                        pass
+                    self._drain()
+                if not r:
+                    if self._hold_tilde:  # lone '~' at line start, no follow-up
+                        self._hold_tilde = False
+                        self._forward_live(b"~")
+                if self._resize_at and time.time() >= self._resize_at:
+                    self._do_resize()
+        finally:
+            self._teardown()
+
+    def _attach(self):
+        t0 = time.time()
+        probe = tty_read(self.host, self.sess, 0, 1)
+        probe_s = time.time() - t0
+        start_cursor = max(0, probe["size"] - self.scrollback)
+        if self.use_wire:
+            try:
+                self.chan = WireChannel(self.host,
+                                        on_event=lambda k, i: self.emit("net", (k, i)))
+                self.chan.connect()
+                self.backend = _WireBackend(self.chan, self.sess, self.emit, self.chan.push)
+            except (Unreachable, BashdError):
+                self.chan = None
+        if self.backend is None:
+            self.backend = _ExecBackend(self.host, self.sess, self.emit)
+            self.backend.rtt = probe_s
+        self._do_resize(force=True)  # remote pane matches the local terminal
+        self._dim("bashd %s term — host=%s session=%s transport=%s — %s" % (
+            VERSION, self.host.name, self.sess,
+            ("wire/%s" % ("push" if self.chan.push else "poll")) if self.chan else "ssh-per-call",
+            _TERM_HELP))
+        first = self._pull(start_cursor, 262144)
+        if first:
+            if start_cursor > 0:  # snap the history tail to a line start
+                nl = first.find(b"\n")
+                if 0 <= nl < len(first) - 1:
+                    first = first[nl + 1:]
+            self._write_out(first)
+        samples = self.backend.latency_samples()
+        self.set_mode(_term_decide_mode(self.want_mode, samples,
+                                        self.backend.kind, self.host.local))
+        self.backend.attach(probe["size"])
+
+    def _teardown(self):
+        try:
+            self.editor.hide()
+        except Exception:
+            pass
+        if self._saved_term is not None:
+            try:
+                termios.tcsetattr(0, termios.TCSANOW, self._saved_term)
+            except termios.error:
+                pass
+        try:
+            self.backend.detach()
+        except Exception:
+            pass
+        if self.chan:
+            self.chan.close()
+        for s, h in ((_signal.SIGWINCH, self._old_winch), (_signal.SIGTERM, self._old_term)):
+            if h is not None:
+                try:
+                    _signal.signal(s, h)
+                except Exception:
+                    pass
+        for fd in (self._qr, self._qwfd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _raw_on(self):
+        self._saved_term = termios.tcgetattr(0)
+        tty.setraw(0)
+        self._old_winch = _signal.getsignal(_signal.SIGWINCH)
+        self._old_term = _signal.getsignal(_signal.SIGTERM)
+        _signal.signal(_signal.SIGWINCH, lambda *a: self.emit("winch", None))
+        _signal.signal(_signal.SIGTERM, lambda *a: self.emit("quit", None))
+
+    # ---- helpers ----
+
+    def _select_timeout(self):
+        if self._hold_tilde:
+            return 0.35
+        if self._resize_at:
+            return max(0.01, self._resize_at - time.time())
+        return None
+
+    def _dim(self, s):
+        os.write(1, b"\r\x1b[K\x1b[2m" + s.encode("utf-8", "replace") + b"\x1b[0m\r\n")
+        self._last_out_nl = True
+        if self.mode == "turn":
+            self.editor.show()
+
+    def _write_out(self, bs):
+        os.write(1, bs)
+        self.bytes_out += len(bs)
+        self._last_out_nl = bs[-1:] in (b"\n", b"\r")
+
+    def _ensure_fresh_line(self):
+        if not self._last_out_nl:
+            os.write(1, b"\r\n")
+            self._last_out_nl = True
+
+    def _pull(self, cursor, mx):
+        try:
+            if self.chan:
+                return self.chan.read(self.sess, cursor, mx)["data"]
+            return tty_read(self.host, self.sess, cursor, mx)["stdout_b"]
+        except (Unreachable, BashdError):
+            return b""
+
+    def _do_resize(self, force=False):
+        self._resize_at = 0.0
+        try:
+            rows, cols, _, _ = struct.unpack("HHHH",
+                                             fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8))
+        except OSError:
+            return
+        if not force and (cols, rows) == (self._cols, self._rows):
+            return
+        self._cols, self._rows = cols, rows
+        self.backend.resize(cols, rows)
+
+    def set_mode(self, m, why=""):
+        if m == self.mode:
+            return
+        self.mode = m
+        if m == "turn":
+            self._ensure_fresh_line()
+            self.editor.show()
+        else:
+            self.editor.hide()
+        self._dim("input mode: %s%s" % (m, " (%s)" % why if why else ""))
+
+    # ---- input paths ----
+
+    def _feed(self, bs):
+        if self.mode == "live":
+            self._feed_live(bs)
+        else:
+            self.editor.feed(bs)
+
+    def _feed_live(self, bs):
+        bs = bs.replace(b"\x00", b"")
+        if not bs:
+            return
+        if self._hold_tilde:
+            self._hold_tilde = False
+            if self._live_escape(bs[:1]):
+                if len(bs) > 1:
+                    self._forward_live(bs[1:])
+                return
+            self._forward_live(b"~" + bs)
+            return
+        if self._live_at_bol and bs[:1] == b"~":  # ssh-style escapes at BOL
+            if len(bs) == 1:
+                self._hold_tilde = True
+                return
+            if self._live_escape(bs[1:2]):
+                if len(bs) > 2:
+                    self._forward_live(bs[2:])
+                return
+        self._forward_live(bs)
+
+    def _live_escape(self, c):
+        """Handle a tilde escape in live mode. True if consumed locally."""
+        if c == b".":
+            self.running = False
+        elif c == b"t":
+            self.set_mode("turn", "escape")
+        elif c == b"i":
+            self._info_line()
+        elif c == b"l":
+            self._dim("already in live input mode")
+        else:
+            return False
+        return True
+
+    def _forward_live(self, bs):
+        self.backend.write(bs)
+        self._live_at_bol = bs[-1:] in (b"\r", b"\n")
+
+    def submit_line(self, line):
+        if line.startswith("~") and len(line) >= 2 and line[1] in ".ilth":
+            c = line[1]
+            if c == ".":
+                self.running = False
+            elif c == "i":
+                self._info_line()
+            elif c == "l":
+                self.set_mode("live", "forced")
+            elif c == "t":
+                self.set_mode("turn", "forced")
+            elif c == "h":
+                self._dim(_TERM_HELP)
+            return
+        if line.startswith("~~"):
+            line = line[1:]
+        if self.gone:
+            self._recreate()
+            if self.gone:
+                self._dim("line dropped (session still gone) — press Up to recover it")
+                return
+        self.backend.write((line + "\r").encode("utf-8", "replace"))
+
+    def ctrl_c(self):
+        self.editor.clear()
+        if not self.gone:
+            self.backend.signal_int()
+
+    def _info_line(self):
+        rtt = (self.chan.rtt if self.chan and self.chan.rtt
+               else getattr(self.backend, "rtt", None))
+        self._dim("mode=%s transport=%s rtt=%s drops=%d out=%dB gone=%s | %s" % (
+            self.mode,
+            ("wire/%s" % ("push" if self.chan.push else "poll")) if self.chan
+            else "ssh-per-call",
+            ("%.0f ms" % (rtt * 1000)) if rtt else "?",
+            self.chan.drops if self.chan else 0, self.bytes_out, self.gone,
+            _TERM_HELP))
+
+    def ctrl_d(self):
+        if not self.editor.buf:
+            self.running = False
+        elif self.editor.pos < len(self.editor.buf):
+            self.editor.buf = (self.editor.buf[:self.editor.pos]
+                               + self.editor.buf[self.editor.pos + 1:])
+            self.editor.render()
+
+    def _recreate(self):
+        self._dim("session gone — recreating (env resets)…")
+        try:
+            session_ensure(self.host, self.sess)
+            r0 = tty_read(self.host, self.sess, 0, 1)
+        except (Unreachable, BashdError) as e:
+            self._dim("recreate failed: %s" % str(e)[:160])
+            return
+        self.backend.reattach(r0["size"])
+        self.gone = False
+
+    # ---- event drain (main thread only) ----
+
+    def _drain(self):
+        while self._q:
+            kind, data = self._q.popleft()
+            if kind == "out":
+                self._write_out(data)
+                if self.mode == "turn" and self.running:
+                    self._ensure_fresh_line()
+                    self.editor.show()
+            elif kind == "gone":
+                self.gone = True
+                self._dim("session ended (exit or killed) — the next command recreates it")
+            elif kind == "net":
+                self._net_event(*data)
+            elif kind == "winch":
+                self._resize_at = time.time() + 0.25  # debounce
+            elif kind == "quit":
+                self.running = False
+
+    def _net_event(self, k, info):
+        if k == "dead":
+            self._dim("link down (%s) — reconnecting…" % str(info)[:140])
+            self.drop_times.append(time.time())
+            self.drop_times = [t for t in self.drop_times if time.time() - t < 120]
+            if (self.mode == "live" and self.want_mode == "auto"
+                    and len(self.drop_times) >= 2):
+                self.set_mode("turn", "auto: repeated link drops")
+        elif k == "reconnected":
+            self._dim("link back (path %s, flavor %s) — resumed from cursor, nothing lost"
+                      % (info.get("path"), info.get("flavor")))
+        elif k == "recovered":
+            self._dim("link back (per-call transport)")
+        elif k == "input-dropped":
+            self._dim("warning: %s unacked input bytes dropped — retype if missing" % info)
+        elif k == "agent-msg":
+            self._dim(str(info)[:160])
+        elif info is not None:
+            self._dim("%s: %s" % (k, str(info)[:140]))
+
+
+def run_term(host, session="main", mode="auto", use_wire=True, scrollback=TERM_ATTACH_BYTES):
+    """Human terminal on a persistent session. Turn-based by nature (line
+    editor; only Enter/Ctrl-C cross the network), an ordinary terminal over a
+    good link (raw passthrough + pushed deltas). Detaching leaves the session
+    alive on the target."""
+    if termios is None:
+        raise BashdError("term needs a POSIX terminal (termios)")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise BashdError("term needs a tty on stdin and stdout")
+    sess = _check_sess_name(session)
+    t0 = time.time()
+    while True:
+        try:
+            session_ensure(host, sess)
+            break
+        except Unreachable as e:
+            if time.time() - t0 > 300:
+                raise
+            print("waiting for %s (%s) — retrying, Ctrl-C to give up…"
+                  % (host.name, str(e)[:120]))
+            time.sleep(2)
+    app = _TermApp(host, sess, mode, use_wire, scrollback)
+    app.run()
+    dt = int(time.time() - app.t0)
+    print("\x1b[2m— detached after %ds · %d bytes streamed · %d link drops · "
+          "session '%s' lives on (`bashd term %s --session %s` reattaches) —\x1b[0m"
+          % (dt, app.bytes_out, app.chan.drops if app.chan else 0, sess, host.name, sess))
+    return {"ok": True, "host": host.name, "session": sess, "duration_s": dt,
+            "bytes_out": app.bytes_out}
+
+
 # ---------------------------------------------------------------- MCP server
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -1534,6 +2917,10 @@ def cli_prune(a):
     _print(do_prune(h, h.name, a.dry_run, stale_s=a.stale_s))
 
 
+def cli_term(a):
+    run_term(get_host(a.host), a.session, a.mode, not a.no_wire, a.scrollback)
+
+
 def _kv(pairs):
     out = {}
     for p in pairs or []:
@@ -1608,6 +2995,19 @@ def build_parser():
 
     p = sub.add_parser("hosts", help="show host registry")
     p.set_defaults(fn=cli_hosts)
+
+    p = sub.add_parser("term", help="human terminal on a persistent session (v0.4)")
+    p.add_argument("host")
+    p.add_argument("--session", default="main",
+                   help="persistent session to attach to (default 'main')")
+    p.add_argument("--mode", choices=["auto", "live", "turn"], default="auto",
+                   help="auto: live (raw passthrough) on good links, turn (line editor) "
+                        "on slow/unstable ones; ~l/~t switch at runtime")
+    p.add_argument("--no-wire", dest="no_wire", action="store_true",
+                   help="skip the wire transport; one ssh call per operation instead")
+    p.add_argument("--scrollback", type=int, default=TERM_ATTACH_BYTES,
+                   help="bytes of session history shown at attach (default %(default)s)")
+    p.set_defaults(fn=cli_term)
 
     p = sub.add_parser("paths", help="per-host route table (cost / sticky / repath-probe state)")
     p.add_argument("host", nargs="?")
@@ -1880,6 +3280,22 @@ def selftest():
         assert sg["action"] == "killed", sg
     check("interactive tty session (write/screen/kill)", t_tty)
 
+    def t_write_nonl():
+        # v0.4 fix: append_newline=False must send EXACTLY the bytes — the
+        # Enter send used to land in the script unconditionally, executing the
+        # half-line behind bash_write's back (fatal for term's raw typing)
+        name = "st" + secrets.token_hex(3)
+        do_start(H, mode="tty", name=name)
+        do_write(H, "tty", name, "echo mk_$((6*7))x", append_newline=False)
+        time.sleep(0.8)
+        r1 = do_read(H, "tty", name)
+        assert "echo mk_" in r1["stdout"] and "mk_42x" not in r1["stdout"], r1
+        do_write(H, "tty", name, "", append_newline=True)
+        w = do_wait(H, "tty", name, timeout_s=10, until="regex", pattern="mk_42x")
+        assert w["match"] == "mk_42x", w
+        do_signal(H, "tty", name, "KILL")
+    check("tty write append_newline=False does not execute", t_write_nonl)
+
     def t_hop():
         # nested ssh hop, end-to-end through this machine's own sshd (skip if no self-auth)
         pre = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o",
@@ -1976,6 +3392,179 @@ def selftest():
             with open(os.path.join(HOME_DIR, "hosts.json"), "w") as f:
                 json.dump({"hosts": {"local": {}}}, f)
     check("cost-aware repath (sync + background) + attempt trail", t_repath)
+
+    def t_wire():
+        # v0.4 wire transport e2e: HELO caps, push, cursor math, RTT, gzip
+        # payloads, Ctrl-C, resize, GONE, and auto-reconnect with no gaps/dups
+        if not shutil.which("tmux"):
+            print("SKIP wire test (no tmux)")
+            return
+        name = "st" + secrets.token_hex(3)
+        session_ensure(H, name)
+        acc = bytearray()
+        gone = threading.Event()
+        events = []
+
+        def cb(data):
+            if data is None:
+                gone.set()
+                return
+            acc.extend(data)
+
+        ch = WireChannel(H, on_event=lambda k, i: events.append((k, i)))
+        info = ch.connect()
+        assert info["ver"] == 1 and ch.flavor in ("bash", "sh"), info
+        sz = tty_read(H, name, 0, 1)["size"]
+        ch.sub(name, sz, cb)
+        ch.write(name, b"echo wire_$((5*9))\r")
+        poll_cur = [sz]
+
+        def wait_marker(marker, timeout=15):
+            end = time.time() + timeout
+            while time.time() < end:
+                if marker in acc:
+                    return True
+                if not ch.push:  # sh flavor: no push, poll explicitly
+                    r = ch.read(name, poll_cur[0], WIRE_PUSH_MAX)
+                    if r["data"]:
+                        acc.extend(r["data"])
+                        poll_cur[0] = r["cursor"]
+                time.sleep(0.15)
+            return False
+
+        assert wait_marker(b"wire_45"), bytes(acc[-400:])
+        r = ch.read(name, 0, 2000)
+        assert r["cursor"] == len(r["data"]) and r["size"] >= r["cursor"], r
+        assert r["alive"] and b"wire_45" in r["data"], r
+        rt = ch.ping()
+        assert rt is not None and 0 <= rt < 10, rt
+        # a >= WIRE_GZ_MIN byte write exercises the gzip payload path
+        ch.write(name, b"echo " + b"K" * 4200 + b"\r")
+        assert wait_marker(b"K" * 64, timeout=20), "big gzip-tagged write never echoed"
+        ch.write(name, b"sleep 30\r")
+        time.sleep(0.5)
+        ch.signal(name, "int")
+        assert wait_marker(b"^C", timeout=10), "no ^C after signal"
+        ch.resize(name, 101, 33)
+        time.sleep(0.8)
+        out = exec_script(H, "tmux -L bashd display-message -p -t %s "
+                              "'#{window_width} #{window_height}'" % name, 10)[1]
+        assert "101 33" in out, out
+        occ = bytes(acc).count(b"wire_45")
+        exec_script(H, "tmux -L bashd kill-session -t %s" % name, 10)
+        if ch.push:
+            assert gone.wait(10), "no GONE after kill-session"
+        # auto-reconnect: monitor re-spawns, re-subs at the delivered cursor
+        ch._die("selftest")
+        deadline = time.time() + 20
+        while ch.dead and time.time() < deadline:
+            time.sleep(0.2)
+        assert not ch.dead, "monitor did not reconnect"
+        session_ensure(H, name)  # log appends: cursor continuity must hold
+        ch.sub(name, ch.cursors.get(name, 0), cb)
+        ch.write(name, b"echo back_$((2*3))\r")
+        assert wait_marker(b"back_6", timeout=15), bytes(acc[-400:])
+        assert bytes(acc).count(b"wire_45") == occ, "output span duplicated after reconnect"
+        ch.close()
+    check("wire transport (frames/push/rtt/signal/resize/GONE/reconnect)", t_wire)
+
+    def t_term():
+        # v0.4 human terminal e2e over a pty: header, turn mode (line editor +
+        # remote echo), live mode (raw passthrough + ~. escape), clean exit,
+        # session survives
+        if not shutil.which("tmux"):
+            print("SKIP term test (no tmux)")
+            return
+        import pty as _pty
+
+        def wait_for(m, buf, needle, timeout=25):
+            end = time.time() + timeout
+            while time.time() < end:
+                r, _, _ = select.select([m], [], [], 0.3)
+                if r:
+                    try:
+                        buf.extend(os.read(m, 65536))
+                    except OSError:
+                        return False
+                if needle in buf:
+                    return True
+            return False
+
+        def case(mode, script, sess):
+            m, s = _pty.openpty()
+            fcntl.ioctl(m, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+            env = dict(os.environ, BASHD_HOME=tmp)
+            p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "term",
+                                  "local", "--session", sess, "--mode", mode],
+                                 stdin=s, stdout=s, stderr=s, env=env)
+            os.close(s)
+            buf = bytearray()
+            try:
+                assert wait_for(m, buf, "term —".encode()), bytes(buf[-500:])
+                for send, expect in script:
+                    os.write(m, send)
+                    assert wait_for(m, buf, expect), \
+                        "missing %r in %r" % (expect, bytes(buf[-500:]))
+                if mode == "turn":
+                    os.write(m, b"~.\r")
+                else:  # live: ssh-style ~. (two chunks, tests the hold)
+                    os.write(m, b"~")
+                    time.sleep(0.05)
+                    os.write(m, b".")
+                try:
+                    rc = p.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    rc = -1
+                assert rc == 0, rc
+            finally:
+                if p.poll() is None:
+                    p.kill()
+                try:
+                    os.close(m)
+                except OSError:
+                    pass
+
+        case("turn", [(b"echo t_$((6*7))\r", b"t_42")], "st" + secrets.token_hex(3))
+        case("live", [(b"echo l_$((3*3))\r", b"l_9")], "st" + secrets.token_hex(3))
+    check("term: human terminal e2e over a pty (turn + live)", t_term)
+
+    def t_wire_shim():
+        # The shim transport (an ssh that's actually a plain local sh) proves:
+        # the bash-agent guard falls back to the sh flavor, and the channel
+        # works over it. Latency-driven mode choice is a unit contract.
+        bindir = os.path.join(tmp, "shim3-bin")
+        os.makedirs(bindir, exist_ok=True)
+        shim = os.path.join(bindir, "ssh")
+        with open(shim, "w") as f:
+            f.write('#!/bin/sh\nexec /bin/sh -s\n')
+        os.chmod(shim, 0o755)
+        old_path = os.environ.get("PATH")
+        os.environ["PATH"] = bindir + os.pathsep + (old_path or "")
+        try:
+            h = Host("slowtest", {"ssh": "slowhost", "paths": ["direct"]})
+            ch = WireChannel(h)
+            info = ch.connect()
+            r = ch.ping(timeout=10)
+            ch.close()
+            # /bin/sh runs the bash agent -> guard exits rc 9 -> sh flavor wins
+            assert info["flavor"] == "sh" and info["push"] is False, info
+            assert r is not None and 0 <= r < 10, r
+            assert _term_decide_mode("auto", [r, r], "wire", False) in ("live", "turn")
+            assert _term_decide_mode("auto", [0.9, 1.1, 0.8], "wire", False) == "turn"
+            assert _term_decide_mode("auto", [0.05, 0.06], "wire", False) == "live"
+            assert _term_decide_mode("auto", [0.4], "wire", False) == "live"   # wire tolerates <= 0.7
+            assert _term_decide_mode("auto", [0.4], "exec", False) == "turn"   # exec needs < 0.25
+            assert _term_decide_mode("auto", [0.05], "exec", False) == "live"
+            assert _term_decide_mode("auto", [0.05], "exec", True) == "live"
+            assert _term_decide_mode("turn", [0.01], "wire", False) == "turn"  # pinned wins
+            assert _term_decide_mode("auto", [], "wire", False) == "turn"      # no samples
+        finally:
+            if old_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = old_path
+    check("wire sh-flavor fallback via shim + input-mode decision rules", t_wire_shim)
 
     def t_prune():
         h = get_host("local", load_config())

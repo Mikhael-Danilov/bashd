@@ -239,3 +239,45 @@ forwarding to untrusted hosts.
   (protocol push is unreliable across clients), agent-level push = CLI `wait` run via background
   Bash (ZCode-native notification).
 - **Second:** drive system `ssh` (ControlMaster + generated ProxyCommand fallbacks); never paramiko.
+
+## 6. v0.4 addendum — human terminal + wire transport
+
+**Question.** bashd is agent-shaped (one ssh exec per operation, JSON envelopes). Two gaps:
+(1) a *human* wants a terminal on a persistent session, not JSON; (2) on an extremely slow
+or unstable link, one ssh exec per poll/input is handshake tax, and remote echo makes every
+keystroke a round trip.
+
+**Prior art reprise.** `ssh -tt host tmux -L bashd attach` already gives an ordinary
+terminal over a good link — but it needs pty allocation on *every* leg (blocked on our
+relay/hop shapes and some clients), dies with the connection, has no turn-based mode, and
+ignores the path/route machinery. tmux's own protocol is chatty for HF-class links. Line-mode
+telnet is the historical ancestor of turn mode. Nothing surveyed combines turn-based input,
+byte-cursor resume, and multipath reconnect — same verdict as §5: build thin on the substrate.
+
+**Design.**
+- *Term = two input disciplines over one output stream.* Output is always the raw byte
+  stream from the session's pipe-pane log (escape sequences pass through — full-screen apps
+  render when sizes match; attach resizes the remote pane to the local terminal). **live**
+  input = raw byte forwarding (pty line discipline on the target turns 0x03 into SIGINT,
+  exactly like ssh); **turn** input = a local line editor so only Enter/Ctrl-C cross the
+  link. Auto picks by measured RTT (wire < 0.7 s, per-call ssh < 0.25 s, local always),
+  auto-degrades live→turn after repeated link drops, never auto-upgrades. One main loop
+  (select on stdin + a self-pipe fed by reader threads) so screen writes never race.
+- *Wire transport = one long-lived channel, frames on top of ssh.* A tiny agent (bash
+  flavor: `read -t` push loop at 10 Hz; POSIX-sh flavor: synchronous answers) speaks
+  single-line frames: W (typed bytes, acked), R (cursor read), S/Z (signal/resize),
+  SUB (push subscription). Payloads are base64 with a g/b gzip tag; the channel itself
+  runs `ssh -C`. Everything rides the existing path machinery (sticky-first spawn,
+  reconnect on death, resume from delivered cursors — logs are the source of truth).
+- *Never replay input.* Sent-but-unacked frames are reported and dropped on reconnect:
+  a replayed Enter could execute a line twice (store-and-forward of *commands* is only
+  safe with idempotency keys the pty cannot provide; queued-while-down input flushes,
+  and the human has local history to retype).
+
+**Measured.** Selftest 26/26 (wire e2e incl. forced channel death + resume; term driven
+over a pty in both modes). Field: over a ~200 ms two-hop relay path — wire/push connects
+in ~3 s, echo round-trips at RTT, a forced mid-stream death reconnects in 0.9 s with
+byte-exact continuity, Ctrl-C and pane resize land; auto selects live there. Known
+limits: NUL bytes are stripped from input (argv); turn-mode editing renders on its own
+line under the remote prompt (line-mode telnet semantics); a lone-`~` line start in live
+mode has ssh's classic escape ambiguity.
