@@ -61,7 +61,7 @@ try:  # term (v0.4) is POSIX-only; everything else keeps working without these
 except ImportError:
     fcntl = struct = termios = tty = None
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ENVKEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DEFAULT_MAX_BYTES = 16384      # per-stream bytes returned per read
@@ -481,7 +481,11 @@ SESS_ENSURE = r'''
 if command -v tmux >/dev/null 2>&1; then :; else echo "BASHD_RESULT no-tmux"; exit 0; fi
 created=0
 if ! tmux -L bashd has-session -t __SESS__ 2>/dev/null; then
-  if tmux -L bashd new-session -d -s __SESS__ -x 220 -y 50 2>/dev/null; then
+  # 9>&-: if SUBMIT_GUARD holds the submit flock on fd 9, a server forked here
+  # would inherit that locked fd and hold the lock for the server's lifetime,
+  # blocking every later submit to this session (2026-10-02: one fleet host's
+  # session was stuck this way for 41h).
+  if 9>&- tmux -L bashd new-session -d -s __SESS__ -x 220 -y 50 2>/dev/null; then
     created=1
   elif ! tmux -L bashd has-session -t __SESS__ 2>/dev/null; then
     echo "BASHD_RESULT tmux-fail"; exit 0
@@ -3188,6 +3192,36 @@ def selftest():
             assert r["status"] == "done" and r["exit_code"] == 0, (i, r)
             assert ("C%d-OK" % i) in r["stdout"] or ("C%d-y" % i) in r["stdout"], (i, r)
     check("concurrent submits into one session all finalize", t_atomic_concurrent)
+
+    def t_guard_fd9_fork():
+        # 2026-10-02 fleet-incident regression: the submit guard holds the
+        # session's submit flock on fd 9 while SESS_ENSURE runs; when the tmux
+        # server doesn't exist yet, new-session forks it and the server used to
+        # inherit that locked fd — the session's submit lock then stayed held
+        # for the server's lifetime and every later submit blocked (flock -w 50
+        # > any sane client timeout). Fix closes fd 9 across the new-session
+        # call; on a throwaway tmux socket, once the submitter releases its own
+        # fd the lock must be FREE.
+        s = stid()
+        sock = "bashd-selftest-" + s
+        lock = os.path.join(os.path.expanduser("~/.bashd"), ".submit-%s.lock" % s)
+        ensure = (SESS_ENSURE.replace("__SESS__", s)
+                             .replace("__INIT__", "export BASHD_SESSION='%s'" % s)
+                             .replace("-L bashd", "-L " + sock))
+        script = (
+            'exec 9>%(lock)s\n'
+            'flock -w 5 9 || { echo GUARD-FAIL; exit 9; }\n'
+            '%(ensure)s\n'
+            'tmux -L %(sock)s has-session -t %(s)s 2>/dev/null || { echo NO-SESSION; exit 8; }\n'
+            'exec 9>&-\n'
+            'if flock -n "%(lock)s" true 2>/dev/null; then echo LOCK-FREE-OK; '
+            'else echo LOCK-HELD-BUG; fi\n'
+            'tmux -L %(sock)s kill-server 2>/dev/null\n'
+            'rm -f "%(lock)s"\n'
+        ) % {"lock": lock, "ensure": ensure, "sock": sock, "s": s}
+        r = do_run(H, script, timeout_s=30, jid=stid())
+        assert "LOCK-FREE-OK" in r["stdout"] and "LOCK-HELD-BUG" not in r["stdout"], r
+    check("server fork under submit guard leaves lock free (fd9 regression)", t_guard_fd9_fork)
 
     def t_orphan_heal():
         # v0.3.1: a codeless, lock-free, quiet job whose session is ALIVE is a
